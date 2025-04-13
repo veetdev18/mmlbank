@@ -1,0 +1,1050 @@
+#!/usr/bin/env python3
+
+import os
+import ccxt
+import pandas as pd
+import numpy as np
+import time
+import random
+from datetime import datetime
+import argparse
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+class VolumeBot:
+    def __init__(self, exchange_name, symbol=None, use_market_orders=True):
+        """
+        Initialize volume bot for a specific exchange
+        
+        Args:
+            exchange_name (str): Name of the exchange (lbank, mexc, bingx)
+            symbol (str): Trading symbol, if None will be taken from .env
+            use_market_orders (bool): Whether to use market orders for matching
+        """
+        self.exchange_name = exchange_name.lower()
+        self.use_market_orders = use_market_orders
+        self.own_orders = []  # Track orders placed by this bot
+        self.initial_orders = []  # Track initial orders specifically
+        self.initial_price = None  # Store initial price to maintain range
+        self.price_control_range = float(os.getenv('PRICE_CONTROL_RANGE', '3'))  # Default 3% range
+        self.buy_sell_ratio = 1.0  # Equal buy/sell ratio by default
+        self.price_direction = os.getenv('PRICE_DIRECTION', 'maintain').lower()  # Price direction control
+        self.cancel_initial_orders = os.getenv('CANCEL_INITIAL_ORDERS', 'false').lower() == 'true'  # Whether to cancel initial orders
+        
+        # Configure exchanges based on name
+        exchange_configs = {
+            'lbank': {
+                'api_key_env': 'LBANK_API_KEY',
+                'secret_key_env': 'LBANK_SECRET_KEY',
+                'symbol_env': 'LBANK_SYMBOL',
+                'class': ccxt.lbank
+            },
+            'mexc': {
+                'api_key_env': 'MEXC_API_KEY',
+                'secret_key_env': 'MEXC_SECRET_KEY',
+                'symbol_env': 'MEXC_SYMBOL',
+                'class': ccxt.mexc,
+                'options': {
+                    'defaultType': 'spot',
+                    'recvWindow': 60000,  # 60 seconds recvWindow for MEXC
+                    'adjustForTimeDifference': True  # Auto-adjust for time difference
+                }
+            },
+            'bingx': {
+                'api_key_env': 'BINGX_API_KEY',
+                'secret_key_env': 'BINGX_SECRET_KEY',
+                'symbol_env': 'BINGX_SYMBOL',
+                'class': ccxt.bingx
+            }
+        }
+        
+        # Check if exchange is supported
+        if self.exchange_name not in exchange_configs:
+            raise ValueError(f"Exchange {exchange_name} not supported")
+        
+        # Get config for the selected exchange
+        config = exchange_configs[self.exchange_name]
+        
+        # Get API credentials
+        api_key = os.getenv(config['api_key_env'])
+        secret_key = os.getenv(config['secret_key_env'])
+        
+        if not api_key or not secret_key:
+            raise ValueError(f"Missing API credentials for {exchange_name}")
+        
+        # Initialize exchange with options specific to each exchange
+        exchange_options = {
+            'apiKey': api_key,
+            'secret': secret_key,
+            'enableRateLimit': True,
+            'options': config.get('options', {'defaultType': 'spot'})
+        }
+        
+        # Special handling for MEXC to fix timestamp issue
+        if self.exchange_name == 'mexc':
+            # Create with time adjustment and large recvWindow
+            exchange_options['options']['adjustForTimeDifference'] = True
+            exchange_options['options']['recvWindow'] = 60000  # 5 minutes
+            
+            # Try to determine server time difference
+            try:
+                temp_exchange = config['class']({'enableRateLimit': True})
+                server_time = temp_exchange.fetch_time()
+                local_time = int(time.time() * 1000)
+                time_diff = server_time - local_time
+                
+                print(f"MEXC server time: {server_time}")
+                print(f"Local time: {local_time}")
+                print(f"Time difference: {time_diff} ms")
+                
+                exchange_options['options']['timeDifference'] = time_diff
+                
+            except Exception as e:
+                print(f"Warning: Could not determine time difference with MEXC server: {e}")
+                print("Using default time synchronization mechanism")
+            
+        self.exchange = config['class'](exchange_options)
+        
+        # Additional setup for MEXC after creation
+        if self.exchange_name == 'mexc':
+            try:
+                # Force a new time sync after exchange creation
+                self.exchange.load_time_difference()
+                time_diff = self.exchange.options.get('timeDifference', 0)
+                print(f"MEXC time difference after sync: {time_diff} ms")
+                
+                # Set extremely large recvWindow
+                self.exchange.options['recvWindow'] = 60000  # 1000 seconds
+                
+            except Exception as e:
+                print(f"Warning: Could not synchronize time with MEXC: {e}")
+                # As a last resort, use a fixed time offset
+                self.exchange.options['timeDifference'] = 0
+        
+        # Set symbol
+        self.symbol = symbol or os.getenv(config['symbol_env'])
+        if not self.symbol:
+            raise ValueError(f"Trading symbol not provided for {exchange_name}")
+        
+        # Validate that the symbol is supported on this exchange
+        try:
+            print(f"Validating that {self.symbol} is supported on {exchange_name}...")
+            markets = self.exchange.load_markets()
+            
+            # Different exchanges format symbols differently
+            # Try both formats: with slash (BTC/USDT) and with underscore (btc_usdt)
+            symbol_slash = self.symbol.replace('_', '/').upper()
+            symbol_underscore = self.symbol.lower().replace('/', '_')
+            
+            if symbol_slash not in markets and symbol_underscore not in markets:
+                # Try the exchange's default symbol format
+                if self.symbol not in markets:
+                    supported_symbols = ', '.join(list(markets.keys())[:10])
+                    raise ValueError(f"Symbol {self.symbol} is not supported on {exchange_name}. Some supported symbols: {supported_symbols}...")
+        except Exception as e:
+            print(f"Warning: Could not validate symbol: {str(e)}")
+            print("Will attempt to continue, but operations may fail if the symbol is not supported")
+            
+        # Load trading parameters from .env
+        self.order_count = int(os.getenv('ORDER_COUNT', '3'))
+        self.min_amount = float(os.getenv('MIN_ORDER_AMOUNT', '10'))
+        self.max_amount = float(os.getenv('MAX_ORDER_AMOUNT', '100'))
+        self.price_range_percent = float(os.getenv('PRICE_RANGE_PERCENT', '2'))
+        self.cycle_delay = int(os.getenv('CYCLE_DELAY', '60'))
+        
+        print(f"Initialized {exchange_name} volume bot for {self.symbol}")
+        print(f"Order count: {self.order_count}, Amount range: {self.min_amount}-{self.max_amount}")
+    
+    def fetch_order_book(self):
+        """Fetch order book for the symbol"""
+        try:
+            order_book = self.exchange.fetch_order_book(self.symbol)
+            print(f"Fetched order book for {self.symbol} on {self.exchange_name}")
+            print(f"Best bid: {order_book['bids'][0][0] if order_book['bids'] else 'None'}")
+            print(f"Best ask: {order_book['asks'][0][0] if order_book['asks'] else 'None'}")
+            return order_book
+        except Exception as e:
+            print(f"Error fetching order book: {str(e)}")
+            return None
+    
+    def get_current_price(self):
+        """Get current price for the symbol"""
+        try:
+            ticker = self.exchange.fetch_ticker(self.symbol)
+            return ticker['last']
+        except Exception as e:
+            print(f"Error fetching current price: {str(e)}")
+            
+            # If ticker fails, try to get price from order book
+            order_book = self.fetch_order_book()
+            if order_book and order_book['bids'] and order_book['asks']:
+                mid_price = (order_book['bids'][0][0] + order_book['asks'][0][0]) / 2
+                print(f"Using mid price from order book: {mid_price}")
+                return mid_price
+            
+            return None
+    
+    def get_orders_in_price_range(self, order_book, current_price, range_percent):
+        """
+        Filter orders from the order book based on price range
+        
+        Args:
+            order_book (dict): Order book with bids and asks
+            current_price (float): Current market price
+            range_percent (float): Price range percentage (e.g. 2 for 2%)
+        
+        Returns:
+            tuple: (filtered_bids, filtered_asks)
+        """
+        if not order_book or not current_price:
+            return [], []
+        
+        # Calculate price range
+        min_price = current_price * (1 - range_percent / 100)
+        max_price = current_price * (1 + range_percent / 100)
+        
+        # Filter bids and asks within range
+        filtered_bids = [bid for bid in order_book['bids'] if min_price <= bid[0] <= current_price]
+        filtered_asks = [ask for ask in order_book['asks'] if current_price <= ask[0] <= max_price]
+        
+        print(f"Price range: {min_price:.8f} - {max_price:.8f}")
+        print(f"Found {len(filtered_bids)} bids and {len(filtered_asks)} asks in range")
+        
+        return filtered_bids, filtered_asks
+
+    def create_market_order(self, side, amount):
+        """Create a market order to match with existing orders"""
+        try:
+            print(f"Placing {side} market order: {amount} {self.symbol}")
+            
+            # For LBank specifically, market buy orders require price parameter
+            if self.exchange_name == 'lbank' and side == 'buy':
+                # Get current price to calculate total cost
+                current_price = self.get_current_price()
+                if not current_price:
+                    print("Cannot get current price for market buy order")
+                    return None
+                
+                print(f"Using price {current_price} for LBank market buy order")
+                
+                # For LBank market buys, we need to include the price
+                result = self.exchange.create_order(
+                    symbol=self.symbol,
+                    type='market',
+                    side=side,
+                    amount=amount,
+                    price=current_price
+                )
+            else:
+                # Normal market order for other exchanges or sell orders
+                result = self.exchange.create_order(
+                    symbol=self.symbol,
+                    type='market',
+                    side=side,
+                    amount=amount
+                )
+            
+            print(f"Market order executed: ID {result['id']}")
+            return result
+        except Exception as e:
+            print(f"Error creating market order: {str(e)}")
+            
+            # Fallback to taker limit order if market order fails
+            try:
+                print(f"Attempting fallback to taker limit order...")
+                
+                # Get order book to determine price
+                order_book = self.fetch_order_book()
+                if not order_book:
+                    print("Could not fetch order book for fallback limit order")
+                    return None
+                
+                # Calculate aggressive price that will be filled immediately (taker)
+                price = None
+                if side == 'buy' and order_book['asks']:
+                    # For buy, set price slightly higher than best ask
+                    price = order_book['asks'][0][0] * 1.001  # 0.1% higher
+                elif side == 'sell' and order_book['bids']:
+                    # For sell, set price slightly lower than best bid
+                    price = order_book['bids'][0][0] * 0.999  # 0.1% lower
+                
+                if not price:
+                    print("Could not determine price for fallback limit order")
+                    return None
+                
+                price = round(price, 8)
+                print(f"Placing {side} limit order (taker): {amount} {self.symbol} @ {price}")
+                
+                # Create aggressive limit order that should be filled immediately
+                result = self.exchange.create_order(
+                    symbol=self.symbol,
+                    type='limit',
+                    side=side,
+                    amount=amount,
+                    price=price
+                )
+                
+                print(f"Limit order executed: ID {result['id']}")
+                return result
+                
+            except Exception as e2:
+                print(f"Error creating fallback limit order: {str(e2)}")
+                return None
+            
+            return None
+    
+    def create_matched_orders(self, order_book):
+        """
+        Create pairs of orders that will match with existing orders in the order book
+        
+        This function creates orders that will be immediately executed by matching
+        with existing orders in the order book, generating actual trading volume.
+        """
+        results = []
+        
+        # Check if we have both bids and asks
+        if not order_book or not order_book['bids'] or not order_book['asks']:
+            print("Order book is empty or missing bids/asks")
+            return results
+        
+        # Store initial price if not set
+        if self.initial_price is None:
+            self.initial_price = self.get_current_price()
+            print(f"Setting initial price reference: {self.initial_price}")
+        
+        # Get current price to check range
+        current_price = self.get_current_price()
+        
+        # Calculate price range limits
+        min_price = self.initial_price * (1 - self.price_control_range / 100)
+        max_price = self.initial_price * (1 + self.price_control_range / 100)
+        
+        print(f"Target price range: {min_price:.8f} - {max_price:.8f}")
+        print(f"Current price: {current_price:.8f}")
+        print(f"Price direction strategy: {self.price_direction}")
+        
+        # Adjust buy/sell ratio based on price direction strategy
+        if self.price_direction == 'increase':
+            # Favor buy orders to increase price
+            self.buy_sell_ratio = 2.0  # 67% buy, 33% sell
+            print("Using INCREASE strategy: Favoring BUY orders to push price up")
+        elif self.price_direction == 'decrease':
+            # Favor sell orders to decrease price
+            self.buy_sell_ratio = 0.3  # 30% buy, 70% sell
+            print("Using DECREASE strategy: Favoring SELL orders to push price down")
+        else:  # 'maintain' or any other value
+            # Adjust buy/sell ratio based on current price position in the range
+            if current_price > max_price:
+                # Price too high, favor sell orders
+                self.buy_sell_ratio = 0.3  # 30% buy, 70% sell
+                print("Price above target range. Favoring SELL orders to bring price down.")
+            elif current_price < min_price:
+                # Price too low, favor buy orders
+                self.buy_sell_ratio = 2.0  # 67% buy, 33% sell
+                print("Price below target range. Favoring BUY orders to bring price up.")
+            else:
+                # Price in range, balance orders
+                # Calculate position within range (0 = at min, 1 = at max)
+                range_position = (current_price - min_price) / (max_price - min_price)
+                # Adjust ratio from 1.5 (at min) to 0.5 (at max)
+                self.buy_sell_ratio = 1.5 - range_position
+                print(f"Price within target range. Setting buy/sell ratio to {self.buy_sell_ratio:.2f}")
+        
+        # Determine order counts based on ratio
+        total_orders = self.order_count
+        buy_orders = int(round(total_orders * (self.buy_sell_ratio / (1 + self.buy_sell_ratio))))
+        sell_orders = total_orders - buy_orders
+        
+        print(f"Order distribution: {buy_orders} buy orders, {sell_orders} sell orders")
+        
+        # First place our own orders to match against
+        own_orders_results = self.place_own_orders_to_match(buy_orders, sell_orders, current_price)
+        results.extend(own_orders_results)
+        
+        # Wait for orders to be placed
+        time.sleep(2)
+        
+        # Now match against our own orders
+        for i in range(total_orders):
+            try:
+                # Attempt to match with our own orders
+                matched_result = self.match_with_own_orders(i < buy_orders)
+                if matched_result:
+                    results.append(matched_result)
+                    time.sleep(1)
+            except Exception as e:
+                print(f"Error matching orders: {str(e)}")
+        
+        return results
+    
+    def place_own_orders_to_match(self, buy_count, sell_count, current_price):
+        """Place our own orders that we'll match against"""
+        results = []
+        
+        # Place buy orders
+        for i in range(buy_count):
+            try:
+                amount = self.create_random_amount()
+                # Place slightly below current price
+                price = round(current_price * (1 - 0.1 / 100), 8)  # 0.1% below
+                
+                order = self.exchange.create_order(
+                    symbol=self.symbol,
+                    type='limit',
+                    side='buy',
+                    amount=amount,
+                    price=price
+                )
+                
+                self.own_orders.append({
+                    'id': order['id'],
+                    'side': 'buy',
+                    'price': price,
+                    'amount': amount,
+                    'matched': False
+                })
+                
+                print(f"Placed own buy order: ID {order['id']} at {price}")
+                results.append(order)
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"Error placing own buy order: {str(e)}")
+        
+        # Place sell orders
+        for i in range(sell_count):
+            try:
+                amount = self.create_random_amount()
+                # Place slightly above current price
+                price = round(current_price * (1 + 0.1 / 100), 8)  # 0.1% above
+                
+                order = self.exchange.create_order(
+                    symbol=self.symbol,
+                    type='limit',
+                    side='sell',
+                    amount=amount,
+                    price=price
+                )
+                
+                self.own_orders.append({
+                    'id': order['id'],
+                    'side': 'sell',
+                    'price': price,
+                    'amount': amount,
+                    'matched': False
+                })
+                
+                print(f"Placed own sell order: ID {order['id']} at {price}")
+                results.append(order)
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"Error placing own sell order: {str(e)}")
+        
+        return results
+    
+    def match_with_own_orders(self, is_buy):
+        """Match with our own orders"""
+        # Find unmatched orders of opposite side
+        side_to_match = 'sell' if is_buy else 'buy'
+        orders_to_match = [o for o in self.own_orders if o['side'] == side_to_match and not o['matched']]
+        
+        if not orders_to_match:
+            print(f"No unmatched {side_to_match} orders to match against")
+            return None
+        
+        # Take the first unmatched order
+        order_to_match = orders_to_match[0]
+        
+        try:
+            # Create opposite order to match
+            side = 'buy' if side_to_match == 'sell' else 'sell'
+            price = order_to_match['price']
+            amount = order_to_match['amount']
+            
+            print(f"Matching with own {side_to_match} order: ID {order_to_match['id']} at {price}")
+            
+            # Create matching order
+            result = self.exchange.create_order(
+                symbol=self.symbol,
+                type='limit',
+                side=side,
+                amount=amount,
+                price=price
+            )
+            
+            # Mark the matched order
+            order_to_match['matched'] = True
+            
+            print(f"Created matching {side} order: ID {result['id']}")
+            return result
+        except Exception as e:
+            print(f"Error matching with own order: {str(e)}")
+            return None
+    
+    def create_self_matching_orders(self):
+        """Create self-matching orders (buy and sell at same price)"""
+        results = []
+        
+        # Get current price
+        current_price = self.get_current_price()
+        if not current_price:
+            print("Cannot get current price for self-matching orders")
+            return results
+        
+        # Store initial price if not set
+        if self.initial_price is None:
+            self.initial_price = current_price
+            print(f"Setting initial price reference: {self.initial_price}")
+        
+        # Calculate price range limits
+        min_price = self.initial_price * (1 - self.price_control_range / 100)
+        max_price = self.initial_price * (1 + self.price_control_range / 100)
+        
+        print(f"Target price range: {min_price:.8f} - {max_price:.8f}")
+        print(f"Current price: {current_price:.8f}")
+        print(f"Price direction strategy: {self.price_direction}")
+        
+        # Adjust price based on price direction strategy
+        if self.price_direction == 'increase':
+            # Create orders above current price to push it up
+            match_price = round(current_price * 1.003, 8)  # 0.3% above
+            print(f"Using INCREASE strategy: Creating orders above current at {match_price}")
+        elif self.price_direction == 'decrease':
+            # Create orders below current price to push it down
+            match_price = round(current_price * 0.997, 8)  # 0.3% below
+            print(f"Using DECREASE strategy: Creating orders below current at {match_price}")
+        else:  # 'maintain' or any other value
+            # Keep original logic for maintaining price in range
+            if current_price > max_price:
+                # Price too high, create orders below current
+                match_price = round(current_price * 0.997, 8)  # 0.3% below
+                print(f"Price above target range. Creating orders below current at {match_price}")
+            elif current_price < min_price:
+                # Price too low, create orders above current
+                match_price = round(current_price * 1.003, 8)  # 0.3% above
+                print(f"Price below target range. Creating orders above current at {match_price}")
+            else:
+                # Price in range, create orders at mid range
+                mid_range = (min_price + max_price) / 2
+                # Bias slightly toward center of range
+                if current_price > mid_range:
+                    match_price = round(current_price * 0.999, 8)  # Slight bias down
+                else:
+                    match_price = round(current_price * 1.001, 8)  # Slight bias up
+                
+                print(f"Price within target range. Creating orders at {match_price}")
+        
+        for i in range(self.order_count):
+            try:
+                # Generate random amount for the pair (same amount for buy and sell)
+                amount = self.create_random_amount()
+                print(f"Using same amount ({amount}) for self-matching buy and sell orders")
+                
+                # First place a limit buy order
+                buy_result = self.exchange.create_order(
+                    symbol=self.symbol,
+                    type='limit',
+                    side='buy',
+                    amount=amount,
+                    price=match_price
+                )
+                
+                print(f"Buy order placed: ID {buy_result['id']}")
+                results.append(buy_result)
+                
+                # Small delay
+                time.sleep(1)
+                
+                # Then place a matching limit sell order at the same price with the same amount
+                sell_result = self.exchange.create_order(
+                    symbol=self.symbol,
+                    type='limit',
+                    side='sell',
+                    amount=amount,  # Using the exact same amount as the buy order
+                    price=match_price
+                )
+                
+                print(f"Sell order placed: ID {sell_result['id']}")
+                results.append(sell_result)
+                
+                # Give time for orders to match
+                time.sleep(3)
+                
+                # Check if orders have been filled
+                try:
+                    buy_order_status = self.exchange.fetch_order(buy_result['id'], self.symbol)
+                    sell_order_status = self.exchange.fetch_order(sell_result['id'], self.symbol)
+                    
+                    print(f"Buy order status: {buy_order_status['status']}")
+                    print(f"Sell order status: {sell_order_status['status']}")
+                    
+                    # Report on balance impact
+                    print(f"Balance impact: {amount} {self.symbol} bought and sold (net zero)")
+                    
+                    # If orders are still open after waiting, cancel them
+                    if buy_order_status['status'] == 'open':
+                        print(f"Canceling unfilled buy order {buy_result['id']}")
+                        self.exchange.cancel_order(buy_result['id'], self.symbol)
+                    
+                    if sell_order_status['status'] == 'open':
+                        print(f"Canceling unfilled sell order {sell_result['id']}")
+                        self.exchange.cancel_order(sell_result['id'], self.symbol)
+                        
+                except Exception as e:
+                    print(f"Error checking order status: {str(e)}")
+                
+            except Exception as e:
+                print(f"Error creating self-matching orders: {str(e)}")
+        
+        return results
+    
+    def create_initial_orders(self, current_price):
+        """
+        Place initial orders above and below the mid price to establish order book
+        
+        Args:
+            current_price (float): Current market price
+            
+        Returns:
+            list: List of created orders
+        """
+        results = []
+        print("\nPlacing initial orders around mid price...")
+        
+        # Store initial price if not set
+        if self.initial_price is None:
+            self.initial_price = current_price
+            print(f"Setting initial price reference: {self.initial_price}")
+        
+        # Number of initial orders to place on each side (buy/sell)
+        initial_order_count = int(os.getenv('INITIAL_ORDER_COUNT', '3'))
+        
+        # Price spread for initial orders (percentage)
+        price_spread = float(os.getenv('INITIAL_PRICE_SPREAD', '5'))
+        
+        # Ensure spread is within our control range
+        price_spread = min(price_spread, self.price_control_range)
+        
+        # Calculate price range
+        min_price = current_price * (1 - price_spread / 100)
+        max_price = current_price * (1 + price_spread / 100)
+        
+        print(f"Creating {initial_order_count} buy and {initial_order_count} sell orders between {min_price:.8f} and {max_price:.8f}")
+        print(f"Price direction strategy: {self.price_direction}")
+        
+        # Adjust the number of buy/sell orders based on price direction
+        buy_order_count = initial_order_count
+        sell_order_count = initial_order_count
+        
+        if self.price_direction == 'increase':
+            # More buy orders than sell orders
+            buy_order_count = int(initial_order_count * 1.5)
+            sell_order_count = int(initial_order_count * 0.5)
+            print(f"Using INCREASE strategy: Placing {buy_order_count} buy orders and {sell_order_count} sell orders")
+        elif self.price_direction == 'decrease':
+            # More sell orders than buy orders
+            buy_order_count = int(initial_order_count * 0.5)
+            sell_order_count = int(initial_order_count * 1.5)
+            print(f"Using DECREASE strategy: Placing {buy_order_count} buy orders and {sell_order_count} sell orders")
+        
+        # Place buy orders below current price
+        for i in range(buy_order_count):
+            try:
+                # Calculate price - evenly distribute across the range
+                price_factor = 1 - ((i + 1) / (buy_order_count + 1)) * (price_spread / 100)
+                price = round(current_price * price_factor, 8)
+                
+                # Generate random amount
+                amount = self.create_random_amount()
+                
+                print(f"Placing buy limit order: {amount} {self.symbol} @ {price} ({price_factor*100:.2f}% of mid price)")
+                
+                # Create buy limit order
+                buy_result = self.exchange.create_order(
+                    symbol=self.symbol,
+                    type='limit',
+                    side='buy',
+                    amount=amount,
+                    price=price
+                )
+                
+                # Track as our own order
+                order_info = {
+                    'id': buy_result['id'],
+                    'side': 'buy',
+                    'price': price,
+                    'amount': amount,
+                    'matched': False
+                }
+                self.own_orders.append(order_info)
+                self.initial_orders.append(order_info)  # Also track as initial order
+                
+                print(f"Buy order placed: ID {buy_result['id']}")
+                results.append(buy_result)
+                
+                # Small delay between orders
+                time.sleep(1)
+                
+            except Exception as e:
+                print(f"Error creating initial buy order: {str(e)}")
+        
+        # Place sell orders above current price
+        for i in range(sell_order_count):
+            try:
+                # Calculate price - evenly distribute across the range
+                price_factor = 1 + ((i + 1) / (sell_order_count + 1)) * (price_spread / 100)
+                price = round(current_price * price_factor, 8)
+                
+                # Generate random amount
+                amount = self.create_random_amount()
+                
+                print(f"Placing sell limit order: {amount} {self.symbol} @ {price} ({price_factor*100:.2f}% of mid price)")
+                
+                # Create sell limit order
+                sell_result = self.exchange.create_order(
+                    symbol=self.symbol,
+                    type='limit',
+                    side='sell',
+                    amount=amount,
+                    price=price
+                )
+                
+                # Track as our own order
+                order_info = {
+                    'id': sell_result['id'],
+                    'side': 'sell',
+                    'price': price,
+                    'amount': amount,
+                    'matched': False
+                }
+                self.own_orders.append(order_info)
+                self.initial_orders.append(order_info)  # Also track as initial order
+                
+                print(f"Sell order placed: ID {sell_result['id']}")
+                results.append(sell_result)
+                
+                # Small delay between orders
+                time.sleep(1)
+                
+            except Exception as e:
+                print(f"Error creating initial sell order: {str(e)}")
+        
+        print(f"Placed {len(results)} initial orders around mid price")
+        return results
+    
+    def cancel_all_initial_orders(self):
+        """Cancel all initial orders that haven't been matched"""
+        print("\nCanceling remaining initial orders...")
+        
+        canceled_count = 0
+        remaining_initial_orders = [o for o in self.initial_orders if not o['matched']]
+        
+        if not remaining_initial_orders:
+            print("No initial orders to cancel")
+            return
+        
+        for order in remaining_initial_orders:
+            try:
+                print(f"Canceling {order['side']} order ID {order['id']} at price {order['price']}")
+                self.exchange.cancel_order(order['id'], self.symbol)
+                order['matched'] = True  # Mark as handled
+                canceled_count += 1
+                
+                # Small delay between cancellations
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"Error canceling order {order['id']}: {str(e)}")
+        
+        print(f"Canceled {canceled_count} initial orders")
+    
+    def create_random_amount(self):
+        """Generate random order amount between min and max"""
+        return round(random.uniform(self.min_amount, self.max_amount), 8)
+    
+    def run_cycle(self):
+        """Run a single cycle of the volume bot"""
+        print(f"\n--- Starting cycle at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
+        
+        # Fetch order book
+        order_book = self.fetch_order_book()
+        if not order_book:
+            print("Failed to fetch order book, skipping cycle")
+            return
+        
+        # Get current price
+        current_price = self.get_current_price()
+        if not current_price:
+            print("Failed to get current price, skipping cycle")
+            return
+        
+        print(f"Current price for {self.symbol}: {current_price}")
+        
+        # Phase 1: Place initial orders around mid price (on every cycle)
+        print("\nPhase 1: Setting up initial orders around mid price...")
+        initial_results = self.create_initial_orders(current_price)
+        if initial_results:
+            print(f"Initial order setup complete. {len(initial_results)} orders placed.")
+            
+            # Wait a bit before continuing with volume trading
+            wait_time = int(os.getenv('WAIT_AFTER_INIT', '20'))
+            print(f"Waiting {wait_time} seconds before continuing with volume trading...")
+            time.sleep(wait_time)
+            
+            # Refresh the order book
+            order_book = self.fetch_order_book()
+            current_price = self.get_current_price()
+        else:
+            print("Failed to set up initial orders, proceeding with volume trading")
+        
+        # Phase 2: Match against existing orders in the order book
+        print("\nPhase 2: Matching against existing orders...")
+        matched_results = self.create_matched_orders(order_book)
+        
+        # Wait a bit before next strategy
+        if matched_results:
+            print(f"Executed {len(matched_results)} market orders")
+            print("Waiting 5 seconds before next strategy...")
+            time.sleep(5)
+        
+        # Update order book after market orders
+        updated_order_book = self.fetch_order_book()
+        
+        # Phase 3: Create self-matching orders
+        print("\nPhase 3: Creating self-matching orders...")
+        self_match_results = self.create_self_matching_orders()
+        
+        if self_match_results:
+            print(f"Created {len(self_match_results)} self-matching orders")
+        
+        # Phase 4: Cancel initial orders if configured to do so
+        if self.cancel_initial_orders:
+            print("\nPhase 4: Canceling initial orders...")
+            self.cancel_all_initial_orders()
+        else:
+            print("\nLeaving initial orders active as configured.")
+        
+        print(f"--- Cycle completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+    
+    def run(self, cycles=None):
+        """
+        Run volume bot for specified number of cycles
+        
+        Args:
+            cycles (int): Number of cycles to run, None for infinite
+        """
+        cycle_count = 0
+        
+        try:
+            print(f"Starting volume bot for {self.exchange_name} ({self.symbol})")
+            print("This bot will execute REAL trades to generate volume")
+            print("Press Ctrl+C to stop at any time")
+            
+            while cycles is None or cycle_count < cycles:
+                self.run_cycle()
+                cycle_count += 1
+                
+                if cycles is None or cycle_count < cycles:
+                    print(f"Waiting {self.cycle_delay} seconds until next cycle...")
+                    time.sleep(self.cycle_delay)
+            
+            print(f"Volume bot completed {cycle_count} cycles")
+            
+        except KeyboardInterrupt:
+            print("\nBot stopped by user")
+        except Exception as e:
+            print(f"Error running bot: {str(e)}")
+
+    def get_supported_symbols(self, limit=10):
+        """Get a list of supported symbols on the exchange"""
+        try:
+            markets = self.exchange.load_markets()
+            symbols = list(markets.keys())
+            return symbols[:limit]
+        except Exception as e:
+            print(f"Error fetching supported symbols: {str(e)}")
+            return []
+
+def main():
+    """Main function to run the volume bot"""
+    parser = argparse.ArgumentParser(description='Volume trading bot for multiple exchanges')
+    
+    parser.add_argument('-e', '--exchange', type=str, required=True,
+                      choices=['lbank', 'mexc', 'bingx', 'all'],
+                      help='Exchange to use (lbank, mexc, bingx, or all)')
+    
+    parser.add_argument('-s', '--symbol', type=str,
+                      help='Trading symbol (overrides .env)')
+    
+    parser.add_argument('-c', '--cycles', type=int, default=1,
+                      help='Number of cycles to run (default: 1, 0 for infinite)')
+    
+    parser.add_argument('-l', '--limit-only', action='store_true',
+                      help='Use only limit orders (no market orders)')
+    
+    parser.add_argument('--list-symbols', action='store_true',
+                      help='List supported symbols on the specified exchange and exit')
+    
+    parser.add_argument('--cancel-initial', action='store_true',
+                      help='Cancel initial orders at the end of each cycle (overrides .env setting)')
+    
+    parser.add_argument('-d', '--direction', type=str, choices=['maintain', 'increase', 'decrease'],
+                      help='Price direction strategy (overrides .env setting)')
+    
+    args = parser.parse_args()
+    
+    # If user requested to list symbols
+    if args.list_symbols:
+        # Can't list symbols for 'all' exchanges at once
+        if args.exchange == 'all':
+            print("Cannot list symbols for 'all' exchanges at once. Please specify a single exchange.")
+            return
+        
+        try:
+            # Create a temporary bot instance just to get symbols
+            print(f"\nListing supported symbols for {args.exchange}...")
+            
+            # Get exchange class from config
+            exchange_configs = {
+                'lbank': ccxt.lbank,
+                'mexc': ccxt.mexc,
+                'bingx': ccxt.bingx
+            }
+            
+            exchange_class = exchange_configs[args.exchange]
+            exchange_instance = exchange_class({
+                'enableRateLimit': True,
+                'options': {'defaultType': 'spot'}
+            })
+            
+            # Load markets and get symbols
+            markets = exchange_instance.load_markets()
+            symbols = list(markets.keys())
+            
+            print(f"\nFound {len(symbols)} supported symbols on {args.exchange}:")
+            
+            # Group by quote currency (USDT, BTC, etc.)
+            grouped_symbols = {}
+            for symbol in symbols:
+                # Most exchanges use / as separator
+                if '/' in symbol:
+                    base, quote = symbol.split('/')
+                    if quote not in grouped_symbols:
+                        grouped_symbols[quote] = []
+                    grouped_symbols[quote].append(symbol)
+            
+            # Print grouped by quote currency
+            for quote in sorted(grouped_symbols.keys()):
+                if len(grouped_symbols[quote]) > 0:
+                    print(f"\n{quote} pairs ({len(grouped_symbols[quote])}):")
+                    # Print 10 examples for each quote currency
+                    for symbol in sorted(grouped_symbols[quote])[:10]:
+                        print(f"  {symbol}")
+                    if len(grouped_symbols[quote]) > 10:
+                        print(f"  ... and {len(grouped_symbols[quote]) - 10} more")
+            
+            # Also show symbols in the exchange's format
+            print("\nNote: When configuring in .env, use the exchange's native format:")
+            if args.exchange == 'lbank':
+                print("  For LBank: Use lowercase with underscore (e.g., btc_usdt)")
+            elif args.exchange == 'bingx':
+                print("  For BingX: Use lowercase with underscore (e.g., btc_usdt)")
+            elif args.exchange == 'mexc':
+                print("  For MEXC: Use uppercase with underscore (e.g., BTC_USDT)")
+            
+            # Save to text file
+            filename = f"{args.exchange}_symbols.txt"
+            print(f"\nSaving complete symbol list to {filename}...")
+            
+            with open(filename, 'w') as f:
+                # Write header
+                f.write(f"Supported trading pairs on {args.exchange.upper()} ({len(symbols)} total)\n")
+                f.write("=" * 60 + "\n\n")
+                
+                # Write grouped by quote currency
+                for quote in sorted(grouped_symbols.keys()):
+                    if len(grouped_symbols[quote]) > 0:
+                        f.write(f"{quote} pairs ({len(grouped_symbols[quote])}):\n")
+                        # Write all symbols for this quote currency
+                        for symbol in sorted(grouped_symbols[quote]):
+                            # Convert to exchange's native format
+                            if args.exchange == 'lbank' or args.exchange == 'bingx':
+                                native_format = symbol.replace('/', '_').lower()
+                            elif args.exchange == 'mexc':
+                                native_format = symbol.replace('/', '_').upper()
+                            else:
+                                native_format = symbol
+                            
+                            f.write(f"  {symbol}  (native format: {native_format})\n")
+                        f.write("\n")
+                        
+                # Write footer with usage instructions
+                f.write("\nUsage instructions:\n")
+                f.write("-----------------\n")
+                f.write("When configuring in .env, use the exchange's native format:\n")
+                if args.exchange == 'lbank':
+                    f.write("For LBank: Use lowercase with underscore (e.g., btc_usdt)\n")
+                elif args.exchange == 'bingx':
+                    f.write("For BingX: Use lowercase with underscore (e.g., btc_usdt)\n")
+                elif args.exchange == 'mexc':
+                    f.write("For MEXC: Use uppercase with underscore (e.g., BTC_USDT)\n")
+            
+            print(f"Symbol list saved to {filename}")
+            
+            # Create a second file with just the native format symbols, one per line
+            native_filename = f"{args.exchange}_native_symbols.txt"
+            print(f"Saving native format symbol list to {native_filename}...")
+            
+            with open(native_filename, 'w') as f:
+                # Write all symbols in exchange's native format, one per line
+                for symbol in sorted(symbols):
+                    if '/' in symbol:
+                        if args.exchange == 'lbank' or args.exchange == 'bingx':
+                            native_format = symbol.replace('/', '_').lower()
+                        elif args.exchange == 'mexc':
+                            native_format = symbol.replace('/', '_').upper()
+                        else:
+                            native_format = symbol
+                        
+                        f.write(f"{native_format}\n")
+            
+            print(f"Native format symbol list saved to {native_filename}")
+            return
+        except Exception as e:
+            print(f"Error listing symbols: {str(e)}")
+            return
+    
+    # Convert 0 cycles to None for infinite running
+    cycles = None if args.cycles == 0 else args.cycles
+    
+    # Whether to use market orders
+    use_market_orders = not args.limit_only
+    
+    if args.exchange == 'all':
+        # Run for all exchanges
+        exchanges = ['lbank', 'mexc', 'bingx']
+        
+        for exchange in exchanges:
+            try:
+                bot = VolumeBot(exchange, args.symbol, use_market_orders)
+                print(f"\nRunning bot for {exchange}...")
+                bot.run(cycles)
+            except Exception as e:
+                print(f"Error with {exchange}: {str(e)}")
+    else:
+        # Run for single exchange
+        bot = VolumeBot(args.exchange, args.symbol, use_market_orders)
+        
+        # Override env settings with command line arguments if provided
+        if args.cancel_initial:
+            bot.cancel_initial_orders = True
+            print("Command-line override: Will cancel initial orders at end of cycle")
+        
+        if args.direction:
+            bot.price_direction = args.direction.lower()
+            print(f"Command-line override: Using price direction strategy: {bot.price_direction}")
+        
+        bot.run(cycles)
+
+if __name__ == "__main__":
+    main() 
