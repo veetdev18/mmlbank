@@ -33,6 +33,13 @@ class VolumeBot:
         self.price_direction = os.getenv('PRICE_DIRECTION', 'maintain').lower()  # Price direction control
         self.cancel_initial_orders = os.getenv('CANCEL_INITIAL_ORDERS', 'false').lower() == 'true'  # Whether to cancel initial orders
         
+        # Wave pattern settings
+        self.use_daily_wave = os.getenv('USE_DAILY_WAVE', 'false').lower() == 'true'
+        self.wave_amplitude = float(os.getenv('WAVE_AMPLITUDE', '3.0'))  # Default 3% wave height
+        self.wave_cycle_hours = float(os.getenv('WAVE_CYCLE_HOURS', '6.0'))  # Default 6-hour cycle (3 up, 3 down)
+        self.wave_reference_price = None  # Reference price for the wave
+        self.wave_reference_time = None  # Reference time for the wave
+        
         # Configure exchanges based on name
         exchange_configs = {
             'lbank': {
@@ -335,22 +342,24 @@ class VolumeBot:
             self.buy_sell_ratio = 0.3  # 30% buy, 70% sell
             print("Using DECREASE strategy: Favoring SELL orders to push price down")
         else:  # 'maintain' or any other value
-            # Adjust buy/sell ratio based on current price position in the range
-            if current_price > max_price:
-                # Price too high, favor sell orders
-                self.buy_sell_ratio = 0.3  # 30% buy, 70% sell
-                print("Price above target range. Favoring SELL orders to bring price down.")
-            elif current_price < min_price:
-                # Price too low, favor buy orders
-                self.buy_sell_ratio = 2.0  # 67% buy, 33% sell
-                print("Price below target range. Favoring BUY orders to bring price up.")
-            else:
-                # Price in range, balance orders
-                # Calculate position within range (0 = at min, 1 = at max)
-                range_position = (current_price - min_price) / (max_price - min_price)
-                # Adjust ratio from 1.5 (at min) to 0.5 (at max)
-                self.buy_sell_ratio = 1.5 - range_position
-                print(f"Price within target range. Setting buy/sell ratio to {self.buy_sell_ratio:.2f}")
+            # If we have a daily wave active, the buy_sell_ratio is already set in update_price_direction_from_wave()
+            if not self.use_daily_wave:
+                # Adjust buy/sell ratio based on current price position in the range
+                if current_price > max_price:
+                    # Price too high, favor sell orders
+                    self.buy_sell_ratio = 0.3  # 30% buy, 70% sell
+                    print("Price above target range. Favoring SELL orders to bring price down.")
+                elif current_price < min_price:
+                    # Price too low, favor buy orders
+                    self.buy_sell_ratio = 2.0  # 67% buy, 33% sell
+                    print("Price below target range. Favoring BUY orders to bring price up.")
+                else:
+                    # Price in range, balance orders
+                    # Calculate position within range (0 = at min, 1 = at max)
+                    range_position = (current_price - min_price) / (max_price - min_price)
+                    # Adjust ratio from 1.5 (at min) to 0.5 (at max)
+                    self.buy_sell_ratio = 1.5 - range_position
+                    print(f"Price within target range. Setting buy/sell ratio to {self.buy_sell_ratio:.2f}")
         
         # Determine order counts based on ratio
         total_orders = self.order_count
@@ -858,6 +867,87 @@ class VolumeBot:
             print(f"Error canceling buy orders: {str(e)}")
             return 0
     
+    def get_wave_target_percentage(self):
+        """
+        Calculate the target percentage change based on the wave pattern
+        Returns a value between -wave_amplitude and +wave_amplitude
+        """
+        if not self.use_daily_wave:
+            return 0.0
+            
+        now = datetime.now()
+        
+        # Calculate total hours including fractional part
+        current_hour = now.hour
+        current_minute = now.minute
+        current_second = now.second
+        hours_decimal = current_hour + (current_minute / 60.0) + (current_second / 3600.0)
+        
+        # Calculate position in the wave cycle (0 to 1 represents a full cycle)
+        # Using modulo to wrap around after each cycle_hours period
+        cycle_position = (hours_decimal % self.wave_cycle_hours) / self.wave_cycle_hours
+        
+        # Using a sine wave to model the price movement
+        # We offset by -π/2 so we start at zero, peak at half cycle, and return to zero
+        angle = (cycle_position * 2 * np.pi) - (np.pi / 2)
+        wave_factor = np.sin(angle)
+        
+        # Scale by the amplitude to get the target percentage
+        target_percentage = wave_factor * self.wave_amplitude
+        
+        current_time = now.strftime('%H:%M:%S')
+        print(f"Wave at {current_time}: Cycle position {cycle_position:.2f}, Target: {target_percentage:.2f}%")
+        
+        return target_percentage
+        
+    def update_price_direction_from_wave(self):
+        """Update price direction strategy based on the wave pattern"""
+        if not self.use_daily_wave:
+            return
+            
+        # Get current position in the wave
+        target_percentage = self.get_wave_target_percentage()
+        
+        # Get current price to establish reference if needed
+        current_price = self.get_current_price()
+        now = datetime.now()
+        
+        # Initialize or update reference price every cycle_hours hours
+        # or if it's not set yet
+        if (self.wave_reference_price is None or 
+            self.wave_reference_time is None or 
+            (now - self.wave_reference_time).total_seconds() > self.wave_cycle_hours * 3600):
+            
+            self.wave_reference_price = current_price
+            self.wave_reference_time = now
+            print(f"Setting new wave reference price: {self.wave_reference_price} at {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Calculate target price based on reference and wave position
+        target_price = self.wave_reference_price * (1 + (target_percentage / 100))
+        
+        # Calculate how far current price is from target
+        price_difference_pct = ((current_price / target_price) - 1) * 100
+        
+        print(f"Wave analysis: Reference {self.wave_reference_price:.8f}, Target {target_price:.8f}, Current {current_price:.8f}")
+        print(f"Price difference from target: {price_difference_pct:.2f}%")
+        
+        # Determine direction based on difference from target
+        if price_difference_pct < -0.5:  # Current price is more than 0.5% below target
+            self.price_direction = 'increase'
+            print("Wave strategy: INCREASE price to reach target")
+            # Set aggressive buy/sell ratio to push price up
+            self.buy_sell_ratio = 3.0  # 75% buy, 25% sell
+        elif price_difference_pct > 0.5:  # Current price is more than 0.5% above target
+            self.price_direction = 'decrease'
+            print("Wave strategy: DECREASE price to reach target")
+            # Set aggressive buy/sell ratio to push price down
+            self.buy_sell_ratio = 0.25  # 20% buy, 80% sell
+        else:
+            self.price_direction = 'maintain'
+            print("Wave strategy: MAINTAIN price near target")
+            # Set balanced ratio
+            self.buy_sell_ratio = 1.0  # 50% buy, 50% sell
+
     def run_cycle(self):
         """Run a single cycle of the volume bot"""
         print(f"\n--- Starting cycle at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
@@ -900,6 +990,11 @@ class VolumeBot:
             return
         
         print(f"Current price for {self.symbol}: {current_price}")
+        
+        # Update price direction strategy based on daily wave pattern if enabled
+        if self.use_daily_wave:
+            print("\nApplying daily wave price pattern strategy...")
+            self.update_price_direction_from_wave()
         
         # Phase 1: Place initial orders around mid price (on every cycle)
         print("\nPhase 1: Setting up initial orders around mid price...")
@@ -1009,8 +1104,14 @@ def main():
     parser.add_argument('--cancel-initial', action='store_true',
                       help='Cancel initial orders at the end of each cycle (overrides .env setting)')
     
-    parser.add_argument('-d', '--direction', type=str, choices=['maintain', 'increase', 'decrease'],
+    parser.add_argument('-d', '--direction', type=str, choices=['maintain', 'increase', 'decrease', 'wave'],
                       help='Price direction strategy (overrides .env setting)')
+    
+    parser.add_argument('--wave-amplitude', type=float,
+                      help='Amplitude of the daily price wave in percent (default: 3%)')
+    
+    parser.add_argument('--wave-cycle', type=float,
+                      help='Wave cycle duration in hours (default: 6 hours - 3 up, 3 down)')
     
     args = parser.parse_args()
     
@@ -1162,8 +1263,19 @@ def main():
             print("Command-line override: Will cancel initial orders at end of cycle")
         
         if args.direction:
-            bot.price_direction = args.direction.lower()
-            print(f"Command-line override: Using price direction strategy: {bot.price_direction}")
+            if args.direction == 'wave':
+                bot.use_daily_wave = True
+                print("Command-line override: Using wave pattern for price movement")
+                if args.wave_amplitude:
+                    bot.wave_amplitude = args.wave_amplitude
+                    print(f"Command-line override: Setting wave amplitude to {bot.wave_amplitude}%")
+                if args.wave_cycle:
+                    bot.wave_cycle_hours = args.wave_cycle
+                    print(f"Command-line override: Setting wave cycle to {bot.wave_cycle_hours} hours")
+            else:
+                bot.price_direction = args.direction.lower()
+                bot.use_daily_wave = False
+                print(f"Command-line override: Using price direction strategy: {bot.price_direction}")
         
         bot.run(cycles)
 
