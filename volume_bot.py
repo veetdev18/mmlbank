@@ -40,6 +40,9 @@ class VolumeBot:
         self.wave_reference_price = None  # Reference price for the wave
         self.wave_reference_time = None  # Reference time for the wave
         
+        # Balance recovery strategy
+        self.balance_recovery_strategy = os.getenv('BALANCE_RECOVERY_STRATEGY', 'cancel_orders').lower()  # 'cancel_orders' or 'sell_assets'
+        
         # Configure exchanges based on name
         exchange_configs = {
             'lbank': {
@@ -948,6 +951,180 @@ class VolumeBot:
             # Set balanced ratio
             self.buy_sell_ratio = 1.0  # 50% buy, 50% sell
 
+    def sell_base_assets_to_reach_balance(self, min_balance=100, current_balance=0):
+        """
+        Sell base assets (e.g., BTC in BTC/USDT) to reach minimum USDT balance
+        
+        Args:
+            min_balance: Minimum USDT balance threshold to aim for
+            current_balance: Current USDT balance
+            
+        Returns:
+            float: Approximate USDT value obtained from selling
+        """
+        try:
+            print(f"\nSelling base assets to free up funds...")
+            
+            # Calculate how much we need to free up
+            balance_deficit = min_balance - current_balance
+            if balance_deficit <= 0:
+                print(f"Current balance ({current_balance} USDT) already above minimum ({min_balance} USDT)")
+                return 0
+            
+            print(f"Need to obtain at least {balance_deficit:.2f} USDT")
+            
+            # Parse the trading symbol to get base asset
+            base_asset = None
+            quote_asset = None
+            
+            # Different exchanges format symbols differently, try to handle various formats
+            if '/' in self.symbol:
+                base_asset, quote_asset = self.symbol.split('/')
+            elif '_' in self.symbol:
+                base_asset, quote_asset = self.symbol.split('_')
+            
+            if not base_asset or not quote_asset:
+                print(f"Unable to parse base and quote assets from symbol {self.symbol}")
+                return 0
+            
+            # Normalize asset names
+            base_asset = base_asset.upper()
+            quote_asset = quote_asset.upper()
+            
+            if quote_asset != 'USDT':
+                print(f"Quote asset is {quote_asset}, not USDT. Cannot sell to increase USDT balance.")
+                return 0
+            
+            # Get available balance of base asset
+            try:
+                balance = self.exchange.fetch_balance()
+                base_balance = float(balance.get(base_asset, {}).get('free', 0))
+                
+                print(f"Available {base_asset} balance: {base_balance}")
+                
+                if base_balance <= 0:
+                    print(f"No {base_asset} available to sell")
+                    return 0
+                
+                # Get current price to estimate value
+                current_price = self.get_current_price()
+                if not current_price:
+                    print("Cannot get current price to estimate value")
+                    return 0
+                
+                estimated_value = base_balance * current_price
+                print(f"Estimated value of {base_balance} {base_asset}: {estimated_value:.2f} USDT")
+                
+                # Determine how much to sell
+                amount_to_sell = min(base_balance, balance_deficit / current_price)
+                if amount_to_sell < 0.0001:
+                    print(f"Amount to sell ({amount_to_sell} {base_asset}) is too small")
+                    return 0
+                
+                estimated_proceeds = amount_to_sell * current_price
+                print(f"Planning to sell {amount_to_sell} {base_asset} (approx. {estimated_proceeds:.2f} USDT)")
+                
+                # Create market sell order
+                result = self.exchange.create_order(
+                    symbol=self.symbol,
+                    type='market',
+                    side='sell',
+                    amount=amount_to_sell
+                )
+                
+                print(f"Market sell order executed: ID {result['id']}")
+                print(f"Sold {amount_to_sell} {base_asset} for approximately {estimated_proceeds:.2f} USDT")
+                
+                return estimated_proceeds
+                
+            except Exception as e:
+                print(f"Error fetching balance or selling assets: {str(e)}")
+                return 0
+            
+        except Exception as e:
+            print(f"Error selling assets: {str(e)}")
+            return 0
+
+    def recover_balance(self, min_balance=100, current_balance=0):
+        """
+        Recover balance using the selected strategy: cancel orders or sell assets
+        
+        Args:
+            min_balance: Minimum USDT balance threshold to aim for
+            current_balance: Current USDT balance
+            
+        Returns:
+            bool: True if balance recovery was attempted, False otherwise
+        """
+        try:
+            balance_deficit = min_balance - current_balance
+            if balance_deficit <= 0:
+                print(f"Current balance ({current_balance} USDT) already above minimum ({min_balance} USDT)")
+                return False
+                
+            print(f"\n⚠️ WARNING: USDT balance ({current_balance:.2f}) is below minimum threshold of {min_balance}")
+            
+            if self.balance_recovery_strategy == 'sell_assets':
+                print("Using SELL ASSETS strategy to recover balance...")
+                proceeds = self.sell_base_assets_to_reach_balance(min_balance, current_balance)
+                
+                if proceeds > 0:
+                    print(f"Sold assets for approximately {proceeds:.2f} USDT. Waiting 10 seconds for balance to update...")
+                    time.sleep(10)  # Wait longer for balance to update
+                    
+                    # Check balance again
+                    new_balance = self.get_usdt_balance()
+                    print(f"Updated USDT balance: {new_balance:.2f}")
+                    
+                    # If still below minimum, warn but continue
+                    if new_balance < min_balance:
+                        print(f"⚠️ Balance still below minimum threshold. Proceeding with caution.")
+                    
+                    return True
+                else:
+                    print("Failed to sell assets. Falling back to canceling orders...")
+                    # Fall back to canceling orders
+                    return self.cancel_orders_to_recover_balance(min_balance, current_balance)
+            else:
+                # Default strategy: cancel orders
+                print("Using CANCEL ORDERS strategy to recover balance...")
+                return self.cancel_orders_to_recover_balance(min_balance, current_balance)
+                
+        except Exception as e:
+            print(f"Error recovering balance: {str(e)}")
+            return False
+
+    def cancel_orders_to_recover_balance(self, min_balance=100, current_balance=0):
+        """
+        Cancel orders to recover balance
+        
+        Args:
+            min_balance: Minimum USDT balance threshold to aim for
+            current_balance: Current USDT balance
+            
+        Returns:
+            bool: True if orders were canceled, False otherwise
+        """
+        print("Canceling buy orders to free up enough funds...")
+        canceled_count = self.cancel_recent_buy_orders(min_balance, current_balance)
+        
+        if canceled_count > 0:
+            print(f"Canceled {canceled_count} buy orders. Waiting 10 seconds for balance to update...")
+            time.sleep(10)  # Wait longer for balance to update
+            
+            # Check balance again
+            new_balance = self.get_usdt_balance()
+            print(f"Updated USDT balance: {new_balance:.2f}")
+            
+            # If still below minimum, warn but continue
+            if new_balance < min_balance:
+                print(f"⚠️ Balance still below minimum threshold. Proceeding with caution.")
+            
+            return True
+        else:
+            print("No buy orders were canceled. Proceeding with caution.")
+            return False
+
     def run_cycle(self):
         """Run a single cycle of the volume bot"""
         print(f"\n--- Starting cycle at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
@@ -957,25 +1134,8 @@ class VolumeBot:
         min_balance_threshold = float(os.getenv('MIN_USDT_BALANCE', '100'))
         
         if usdt_balance < min_balance_threshold:
-            print(f"\n⚠️ WARNING: USDT balance ({usdt_balance:.2f}) is below minimum threshold of {min_balance_threshold}")
-            print("Canceling buy orders to free up enough funds...")
-            
-            # Cancel enough buy orders to get above the min balance
-            canceled_count = self.cancel_recent_buy_orders(min_balance=min_balance_threshold, current_balance=usdt_balance)
-            
-            if canceled_count > 0:
-                print(f"Canceled {canceled_count} buy orders. Waiting 10 seconds for balance to update...")
-                time.sleep(10)  # Wait longer for balance to update
-                
-                # Check balance again
-                new_balance = self.get_usdt_balance()
-                print(f"Updated USDT balance: {new_balance:.2f}")
-                
-                # If still below minimum, warn but continue
-                if new_balance < min_balance_threshold:
-                    print(f"⚠️ Balance still below minimum threshold. Proceeding with caution.")
-            else:
-                print("No buy orders were canceled. Proceeding with caution.")
+            # Use the selected balance recovery strategy
+            self.recover_balance(min_balance=min_balance_threshold, current_balance=usdt_balance)
         
         # Fetch order book
         order_book = self.fetch_order_book()
@@ -1112,6 +1272,9 @@ def main():
     
     parser.add_argument('--wave-cycle', type=float,
                       help='Wave cycle duration in hours (default: 6 hours - 3 up, 3 down)')
+    
+    parser.add_argument('--balance-strategy', type=str, choices=['cancel_orders', 'sell_assets'],
+                      help='Strategy to use when balance is below minimum (cancel_orders or sell_assets)')
     
     args = parser.parse_args()
     
@@ -1276,6 +1439,10 @@ def main():
                 bot.price_direction = args.direction.lower()
                 bot.use_daily_wave = False
                 print(f"Command-line override: Using price direction strategy: {bot.price_direction}")
+        
+        if args.balance_strategy:
+            bot.balance_recovery_strategy = args.balance_strategy
+            print(f"Command-line override: Using {bot.balance_recovery_strategy} strategy for balance recovery")
         
         bot.run(cycles)
 
