@@ -762,9 +762,130 @@ class VolumeBot:
         """Generate random order amount between min and max"""
         return round(random.uniform(self.min_amount, self.max_amount), 8)
     
+    def get_usdt_balance(self):
+        """Get the current USDT balance"""
+        try:
+            balance = self.exchange.fetch_balance()
+            
+            # Different exchanges might format currency differently
+            usdt_balance = 0
+            
+            # Try different possible USDT keys
+            for currency in ['USDT', 'usdt']:
+                if currency in balance:
+                    usdt_balance = float(balance[currency].get('free', 0))
+                    print(f"Current {currency} balance: {usdt_balance}")
+                    return usdt_balance
+            
+            print("USDT balance not found")
+            return 0
+        except Exception as e:
+            print(f"Error fetching balance: {str(e)}")
+            return 0
+    
+    def cancel_recent_buy_orders(self, min_balance=100, current_balance=0):
+        """
+        Cancel recent buy orders until enough funds are freed to reach min_balance
+        
+        Args:
+            min_balance: Minimum USDT balance threshold to aim for
+            current_balance: Current USDT balance
+            
+        Returns:
+            int: Number of orders canceled
+        """
+        try:
+            print(f"\nFetching open orders to free up funds...")
+            
+            # Calculate how much we need to free up
+            balance_deficit = min_balance - current_balance
+            if balance_deficit <= 0:
+                print(f"Current balance ({current_balance} USDT) already above minimum ({min_balance} USDT)")
+                return 0
+                
+            print(f"Need to free up at least {balance_deficit:.2f} USDT to reach minimum balance")
+            
+            # Fetch all open orders
+            open_orders = self.exchange.fetch_open_orders(self.symbol)
+            
+            # Filter to get only buy orders
+            buy_orders = [order for order in open_orders if order['side'].lower() == 'buy']
+            
+            if not buy_orders:
+                print("No buy orders found to cancel")
+                return 0
+            
+            print(f"Found {len(buy_orders)} open buy orders")
+            
+            # Sort by timestamp (most recent first)
+            buy_orders.sort(key=lambda x: x['timestamp'], reverse=True)
+            
+            # Start canceling orders until we've freed up enough or run out of orders
+            canceled_count = 0
+            freed_value = 0
+            
+            for i, order in enumerate(buy_orders):
+                # Calculate order value (how much USDT it's using)
+                order_price = float(order['price'])
+                order_amount = float(order['amount'])
+                order_value = order_price * order_amount
+                
+                try:
+                    print(f"Canceling buy order {i+1}/{len(buy_orders)}: ID {order['id']} - {order_amount} @ {order_price} = {order_value:.2f} USDT")
+                    self.exchange.cancel_order(order['id'], self.symbol)
+                    canceled_count += 1
+                    freed_value += order_value
+                    
+                    print(f"Freed up approximately {order_value:.2f} USDT (total: {freed_value:.2f} USDT)")
+                    
+                    # Check if we've freed up enough
+                    if freed_value >= balance_deficit:
+                        print(f"Freed up enough funds ({freed_value:.2f} USDT) to reach minimum balance")
+                        break
+                    
+                    # Small delay between cancellations
+                    time.sleep(0.5)
+                except Exception as e:
+                    print(f"Error canceling order {order['id']}: {str(e)}")
+            
+            print(f"Successfully canceled {canceled_count} buy orders, freeing approximately {freed_value:.2f} USDT")
+            estimated_new_balance = current_balance + freed_value
+            print(f"Estimated new balance: {estimated_new_balance:.2f} USDT (minimum required: {min_balance} USDT)")
+            
+            return canceled_count
+            
+        except Exception as e:
+            print(f"Error canceling buy orders: {str(e)}")
+            return 0
+    
     def run_cycle(self):
         """Run a single cycle of the volume bot"""
         print(f"\n--- Starting cycle at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
+        
+        # Check USDT balance first
+        usdt_balance = self.get_usdt_balance()
+        min_balance_threshold = float(os.getenv('MIN_USDT_BALANCE', '100'))
+        
+        if usdt_balance < min_balance_threshold:
+            print(f"\n⚠️ WARNING: USDT balance ({usdt_balance:.2f}) is below minimum threshold of {min_balance_threshold}")
+            print("Canceling buy orders to free up enough funds...")
+            
+            # Cancel enough buy orders to get above the min balance
+            canceled_count = self.cancel_recent_buy_orders(min_balance=min_balance_threshold, current_balance=usdt_balance)
+            
+            if canceled_count > 0:
+                print(f"Canceled {canceled_count} buy orders. Waiting 10 seconds for balance to update...")
+                time.sleep(10)  # Wait longer for balance to update
+                
+                # Check balance again
+                new_balance = self.get_usdt_balance()
+                print(f"Updated USDT balance: {new_balance:.2f}")
+                
+                # If still below minimum, warn but continue
+                if new_balance < min_balance_threshold:
+                    print(f"⚠️ Balance still below minimum threshold. Proceeding with caution.")
+            else:
+                print("No buy orders were canceled. Proceeding with caution.")
         
         # Fetch order book
         order_book = self.fetch_order_book()
