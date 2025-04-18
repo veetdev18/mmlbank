@@ -60,6 +60,7 @@ class VolumeBot:
         self.max_ask_orders_per_cycle = int(os.getenv('MAX_ASK_ORDERS_PER_CYCLE', '10'))  # Maximum sell orders to place in one cycle
         self.max_open_orders = int(os.getenv('MAX_OPEN_ORDERS', '50'))  # Maximum total open orders allowed
         self.order_placement_delay = float(os.getenv('ORDER_PLACEMENT_DELAY', '1.5'))  # Delay between order placements in seconds
+        self.cancel_recent_percent = float(os.getenv('CANCEL_RECENT_PERCENT', '30'))  # Percentage of recent orders to cancel when hitting limits
         self.depth_orders = []  # Track orders placed for depth maintenance
         
         # Configure exchanges based on name
@@ -1203,6 +1204,83 @@ class VolumeBot:
             print(f"Error during order cleanup: {str(e)}")
             return False
 
+    def cancel_recent_orders(self, percent=None):
+        """
+        Cancel a percentage of the most recent orders to make room for new ones
+        
+        Args:
+            percent: Percentage of recent orders to cancel (0-100)
+            
+        Returns:
+            bool: True if cancellation was performed, False otherwise
+        """
+        try:
+            # Get current open orders
+            open_orders = self.exchange.fetch_open_orders(self.symbol)
+            
+            if not open_orders:
+                print("No open orders to cancel")
+                return False
+                
+            # Use provided percent or default from settings
+            cancel_percent = percent if percent is not None else self.cancel_recent_percent
+            
+            print(f"\n⚠️ Reached order limit. Canceling {cancel_percent:.1f}% of most recent open orders...")
+            
+            # Sort all open orders by timestamp (newest first)
+            # Note: Different exchanges may have different timestamp formats
+            # Some use 'timestamp' and others use 'datetime' or other fields
+            try:
+                # Try standard 'timestamp' field first
+                open_orders.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
+            except Exception as e:
+                print(f"Warning: Error sorting by timestamp: {str(e)}")
+                # If sorting fails, we'll just use the order as returned by the exchange
+                # which is often already sorted by recency
+            
+            # Calculate how many to cancel
+            orders_to_cancel = max(1, min(len(open_orders), int(len(open_orders) * cancel_percent / 100)))
+            
+            print(f"Canceling {orders_to_cancel} most recent orders out of {len(open_orders)} total open orders")
+            
+            canceled_count = 0
+            canceled_ids = []
+            
+            for i in range(orders_to_cancel):
+                try:
+                    order = open_orders[i]
+                    order_id = order['id']
+                    side = order.get('side', 'unknown')
+                    price = order.get('price', 0)
+                    amount = order.get('amount', 0)
+                    
+                    print(f"Canceling #{i+1}/{orders_to_cancel}: {side} order {order_id} - {amount} @ {price}")
+                    
+                    self.exchange.cancel_order(order_id, self.symbol)
+                    canceled_count += 1
+                    canceled_ids.append(order_id)
+                    
+                    # Brief delay between cancellations
+                    time.sleep(0.5)
+                except Exception as e:
+                    print(f"Error canceling order {open_orders[i].get('id')}: {str(e)}")
+            
+            # Update depth_orders tracking list to remove canceled orders
+            self.depth_orders = [o for o in self.depth_orders if o.get('id') not in canceled_ids]
+            
+            print(f"Successfully canceled {canceled_count}/{orders_to_cancel} recent orders")
+            
+            # Allow some time for the exchange to process cancellations
+            if canceled_count > 0:
+                print("Waiting 5 seconds for cancellations to process...")
+                time.sleep(5)
+            
+            return canceled_count > 0
+            
+        except Exception as e:
+            print(f"Error canceling recent orders: {str(e)}")
+            return False
+
     def maintain_order_book_depth(self, current_price):
         """
         Maintain a specific total USDT value of orders in the order book within defined depth
@@ -1239,8 +1317,16 @@ class VolumeBot:
             # Check if we're at the order limit
             if len(open_orders) >= self.max_open_orders:
                 print(f"⚠️ WARNING: Open order count ({len(open_orders)}) has reached the maximum limit ({self.max_open_orders})")
-                print("Cannot place more orders until some existing orders are filled or canceled")
-                return []
+                print(f"Canceling {self.cancel_recent_percent}% of recent orders to make room for new ones")
+                
+                # Cancel recent orders to make room
+                if self.cancel_recent_orders():
+                    # Refresh open orders after cancellation
+                    open_orders = self.exchange.fetch_open_orders(self.symbol)
+                    print(f"After cancellation: {len(open_orders)} open orders remaining")
+                else:
+                    print("Cannot place more orders until some existing orders are filled or canceled")
+                    return []
             
             # Filter orders within our depth range
             existing_bids = [o for o in open_orders if o['side'].lower() == 'buy' and float(o['price']) >= min_price and float(o['price']) <= current_price]
@@ -1397,143 +1483,172 @@ class VolumeBot:
     
     def place_depth_bids_to_target(self, target_value, min_price, current_price, min_orders=0, max_orders=None):
         """
-        Place buy orders with random amounts until reaching target USDT value
+        Place buy orders within a price range to reach a target total value
         
         Args:
-            target_value: Target USDT value to reach
-            min_price: Minimum price in the range
-            current_price: Current market price
-            min_orders: Minimum number of orders to place regardless of value
-            max_orders: Maximum number of orders to place
+            target_value (float): Target total value in USDT to place
+            min_price (float): Minimum price for orders
+            current_price (float): Current price (maximum price for buy orders)
+            min_orders (int): Minimum number of orders to place
+            max_orders (int): Maximum number of orders to place
             
         Returns:
-            list: Created orders
+            list: Placed orders
         """
-        results = []
-        
-        # If no value needed and no minimum orders required, return early
-        if target_value <= 0 and min_orders <= 0:
-            return results
-            
-        # If no value needed but we need to place minimum orders
         if target_value <= 0:
-            target_value = min_orders * 5  # Ensure at least $5 per order
+            return []
+        
+        # Cap maximum orders if specified
+        if max_orders is not None and max_orders <= 0:
+            return []
+        
+        # Ensure min and max prices are in the right order
+        min_price = min(min_price, current_price)
+        max_price = current_price  # For buy orders, max price is current price
+        
+        print(f"Placing buy orders to reach {target_value:.2f} USDT total value")
+        print(f"Price range: {min_price:.8f} - {max_price:.8f}")
+        
+        if min_orders > 0:
+            print(f"Minimum orders to place: {min_orders}")
+        
+        if max_orders is not None:
+            print(f"Maximum orders to place: {max_orders}")
             
-        print(f"Placing buy orders to reach target value of {target_value:.2f} USDT (minimum {min_orders} orders, maximum {max_orders if max_orders else 'unlimited'} orders)")
+        # Calculate the price step to distribute orders across the range
+        price_range = max_price - min_price
         
-        # Price range for placing orders
-        price_range = current_price - min_price
+        # We need at least 2 orders for a real range distribution, so adjust min_orders if needed
+        adjusted_min_orders = max(min_orders, 2) if price_range > 0 else min_orders
         
-        # Track total value placed and order count
-        total_value_placed = 0
+        # For a very narrow range, we might need fewer orders
+        if price_range == 0:
+            # If no range, just place at the one price point
+            price_points = [min_price]
+            step_count = 0
+        else:
+            # Start with a reasonable number of price points that form a "ladder"
+            # but ensure we have at least the minimum
+            step_count = max(5, adjusted_min_orders)
+            
+            # If max_orders is specified, cap the step count
+            if max_orders is not None:
+                step_count = min(step_count, max_orders)
+            
+            # Create evenly distributed price points
+            price_step = price_range / step_count
+            price_points = [min_price + i * price_step for i in range(step_count+1)]
+        
+        # Decide how many orders to place at each price point
+        orders_per_price = 1  # Start with 1 order per price
+        
+        # If we need more orders than price points, we'll place multiple orders at each price
+        total_price_points = len(price_points)
+        if min_orders > total_price_points:
+            orders_per_price = (min_orders + total_price_points - 1) // total_price_points
+        
+        # Calculate approximate USDT value for each order to reach target
+        total_orders_to_place = total_price_points * orders_per_price
+        if max_orders is not None:
+            total_orders_to_place = min(total_orders_to_place, max_orders)
+        
+        usdt_per_order = target_value / max(1, total_orders_to_place)
+        
+        # Convert to base currency amount
+        # For buy orders, we divide USDT value by price to get base currency amount
+        base_amounts = [usdt_per_order / max(price, 0.00000001) for price in price_points]
+        
+        # Cap amounts based on min/max bid amount settings
+        capped_amounts = []
+        for amount in base_amounts:
+            if amount < self.min_bid_amount:
+                capped_amount = self.min_bid_amount
+            elif amount > self.max_bid_amount:
+                capped_amount = self.max_bid_amount
+            else:
+                capped_amount = amount
+            capped_amounts.append(capped_amount)
+        
+        # Calculate total value after capping
+        total_value_after_cap = sum(price * amount for price, amount in zip(price_points, capped_amounts))
+        
+        # If total is less than target, try to scale up within min/max limits
+        if total_value_after_cap < target_value and total_value_after_cap > 0:
+            scale_factor = target_value / total_value_after_cap
+            
+            # Scale up amounts but respect max limit
+            adjusted_amounts = []
+            for amount in capped_amounts:
+                adjusted = amount * scale_factor
+                if adjusted > self.max_bid_amount:
+                    adjusted = self.max_bid_amount
+                adjusted_amounts.append(adjusted)
+                
+            # Update amounts with scaled version
+            capped_amounts = adjusted_amounts
+        
+        # Prepare to distribute orders across prices
+        order_distribution = []
+        placed_order_count = 0
+        
+        for i, (price, base_amount) in enumerate(zip(price_points, capped_amounts)):
+            # Calculate how many orders to place at this price
+            remaining_capacity = 0 if max_orders is None else max_orders - placed_order_count
+            
+            if max_orders is not None and placed_order_count >= max_orders:
+                break
+                
+            # Determine orders at this price point
+            orders_at_this_price = orders_per_price
+            
+            # If we have a max_orders limit, make sure we don't exceed it
+            if max_orders is not None:
+                orders_at_this_price = min(orders_at_this_price, remaining_capacity)
+            
+            # Add orders to our distribution
+            for _ in range(orders_at_this_price):
+                order_distribution.append((price, base_amount))
+                placed_order_count += 1
+                
+                # Check if we've hit the maximum
+                if max_orders is not None and placed_order_count >= max_orders:
+                    break
+        
+        # Now place the orders
+        results = []
         orders_placed = 0
+        total_value_placed = 0
         
-        # Handle the "open order size is too large" error
-        consecutive_errors = 0
-        
-        # Continue placing orders until we reach the target value AND minimum order count
-        while (total_value_placed < target_value or orders_placed < min_orders):
-            # Break if we've reached the maximum orders (if specified)
-            if max_orders is not None and orders_placed >= max_orders:
-                print(f"Reached maximum order limit of {max_orders}, stopping order placement")
-                break
-                
-            # Break if we've had too many consecutive errors
-            if consecutive_errors >= 3:
-                print("Too many consecutive errors, stopping order placement")
-                break
-                
+        for price, amount in order_distribution:
             try:
-                # Generate a random price within the range
-                # Bias slightly toward current price (better chance of execution)
-                random_factor = random.random() ** 1.5  # Power of 1.5 biases toward higher values
-                price = round(min_price + (price_range * random_factor), 8)
+                # Round amount to 8 decimal places (or whatever precision the exchange requires)
+                rounded_amount = round(amount, 8)
                 
-                # Calculate remaining value needed
-                remaining_value = max(5.0, target_value - total_value_placed)
-                
-                # Generate random order size based on remaining value and min/max constraints
-                # Min size is either our configured min or enough to buy 5 USDT worth, whichever is larger
-                min_size = max(self.min_bid_amount, 5 / price)
-                
-                # Max size is either our configured max or enough for 50% of remaining value
-                # This ensures we don't use up all remaining value in one order
-                max_size = min(self.max_bid_amount, (remaining_value * 0.5) / price)
-                
-                # If max < min, use min
-                if max_size < min_size:
-                    max_size = min_size
-                
-                # Random amount between min and max
-                amount = round(random.uniform(min_size, max_size), 8)
-                
-                # Calculate actual USDT value of this order
-                usdt_value = amount * price
-                
-                # Ensure we don't exceed target by too much (unless we need minimum orders)
-                if orders_placed >= min_orders and total_value_placed + usdt_value > target_value * 1.05:
-                    # Adjust amount to reach target exactly
-                    amount = round((target_value - total_value_placed) / price, 8)
-                    usdt_value = amount * price
-                
-                # Skip order if amount is too small
-                if amount < self.min_bid_amount or usdt_value < 5:
+                # Skip very small amounts
+                if rounded_amount < 0.00000001:
                     continue
                 
-                print(f"Placing depth buy order: {amount} {self.symbol} @ {price} = {usdt_value:.2f} USDT ({(price/current_price*100):.2f}% of current price)")
+                print(f"Placing buy order: {rounded_amount} at price {price:.8f} = {rounded_amount * price:.2f} USDT")
                 
-                # Create buy limit order
-                result = self.exchange.create_order(
-                    symbol=self.symbol,
-                    type='limit',
-                    side='buy',
-                    amount=amount,
-                    price=price
-                )
+                # Place the order
+                order = self.exchange.create_limit_buy_order(self.symbol, rounded_amount, price)
                 
-                # Reset error counter on success
-                consecutive_errors = 0
+                # Track this order
+                order['timestamp'] = int(time.time() * 1000)  # Make sure order has a timestamp
+                self.depth_orders.append(order)
+                results.append(order)
                 
-                # Track as depth maintenance order
-                order_info = {
-                    'id': result['id'],
-                    'side': 'buy',
-                    'price': price,
-                    'amount': amount,
-                    'timestamp': int(time.time() * 1000),
-                    'value': usdt_value
-                }
-                self.depth_orders.append(order_info)
-                
-                # Update total placed and order count
-                total_value_placed += usdt_value
+                total_value_placed += rounded_amount * price
                 orders_placed += 1
                 
-                print(f"Buy depth order placed: ID {result['id']} - Progress: {total_value_placed:.2f}/{target_value:.2f} USDT ({(total_value_placed/target_value*100):.1f}%), Orders: {orders_placed}/{max(min_orders, 1)}")
-                
-                results.append(result)
-                
-                # Delay between order placements
+                # Delay between orders
                 time.sleep(self.order_placement_delay)
                 
-                # If we're very close to target and have placed minimum orders, consider it complete
-                if total_value_placed >= target_value * 0.95 and orders_placed >= min_orders:
-                    break
-                    
             except Exception as e:
-                error_msg = str(e).lower()
-                consecutive_errors += 1
-                
-                if "open order size is too large" in error_msg or "too many open orders" in error_msg:
-                    print(f"⚠️ Exchange order limit reached: {str(e)}")
-                    print("Performing emergency cleanup of old orders...")
-                    
-                    # Try to clean up some orders
-                    cleaned_up = self.cleanup_old_orders_if_needed(max_orders_to_cancel=20)
-                    
-                    # If cleanup was successful, reset error counter
-                    if cleaned_up:
-                        consecutive_errors = 0
+                if "MAX_OPEN_ORDERS" in str(e) or "maximum number of orders" in str(e):
+                    print(f"Hit exchange order limit. Cannot place more buy orders.")
+                    # Try to clean up some old orders to make room
+                    if self.cleanup_old_orders_if_needed():
                         print("Cleanup complete, continuing with order placement")
                         time.sleep(5)  # Extra wait time after cleanup
                     else:
@@ -1547,147 +1662,168 @@ class VolumeBot:
         print(f"Total buy order value placed: {total_value_placed:.2f} USDT (target: {target_value:.2f} USDT)")
         print(f"Total buy orders placed: {orders_placed} (minimum: {min_orders})")
         return results
-    
+
     def place_depth_asks_to_target(self, target_value, current_price, max_price, min_orders=0, max_orders=None):
         """
-        Place sell orders with random amounts until reaching target USDT value
+        Place sell orders within a price range to reach a target total value
         
         Args:
-            target_value: Target USDT value to reach
-            current_price: Current market price
-            max_price: Maximum price in the range
-            min_orders: Minimum number of orders to place regardless of value
-            max_orders: Maximum number of orders to place
+            target_value (float): Target total value in USDT to place
+            current_price (float): Current price (minimum price for sell orders)
+            max_price (float): Maximum price for orders
+            min_orders (int): Minimum number of orders to place
+            max_orders (int): Maximum number of orders to place
             
         Returns:
-            list: Created orders
+            list: Placed orders
         """
-        results = []
-        
-        # If no value needed and no minimum orders required, return early
-        if target_value <= 0 and min_orders <= 0:
-            return results
-            
-        # If no value needed but we need to place minimum orders
         if target_value <= 0:
-            target_value = min_orders * 5  # Ensure at least $5 per order
+            return []
+        
+        # Cap maximum orders if specified
+        if max_orders is not None and max_orders <= 0:
+            return []
+        
+        # Ensure min and max prices are in the right order
+        min_price = current_price  # For sell orders, min price is current price
+        max_price = max(max_price, current_price)
+        
+        print(f"Placing sell orders to reach {target_value:.2f} USDT total value")
+        print(f"Price range: {min_price:.8f} - {max_price:.8f}")
+        
+        if min_orders > 0:
+            print(f"Minimum orders to place: {min_orders}")
+        
+        if max_orders is not None:
+            print(f"Maximum orders to place: {max_orders}")
             
-        print(f"Placing sell orders to reach target value of {target_value:.2f} USDT (minimum {min_orders} orders, maximum {max_orders if max_orders else 'unlimited'} orders)")
+        # Calculate the price step to distribute orders across the range
+        price_range = max_price - min_price
         
-        # Price range for placing orders
-        price_range = max_price - current_price
+        # We need at least 2 orders for a real range distribution, so adjust min_orders if needed
+        adjusted_min_orders = max(min_orders, 2) if price_range > 0 else min_orders
         
-        # Track total value placed and order count
-        total_value_placed = 0
+        # For a very narrow range, we might need fewer orders
+        if price_range == 0:
+            # If no range, just place at the one price point
+            price_points = [min_price]
+            step_count = 0
+        else:
+            # Start with a reasonable number of price points that form a "ladder"
+            # but ensure we have at least the minimum
+            step_count = max(5, adjusted_min_orders)
+            
+            # If max_orders is specified, cap the step count
+            if max_orders is not None:
+                step_count = min(step_count, max_orders)
+            
+            # Create evenly distributed price points
+            price_step = price_range / step_count
+            price_points = [min_price + i * price_step for i in range(step_count+1)]
+        
+        # Decide how many orders to place at each price point
+        orders_per_price = 1  # Start with 1 order per price
+        
+        # If we need more orders than price points, we'll place multiple orders at each price
+        total_price_points = len(price_points)
+        if min_orders > total_price_points:
+            orders_per_price = (min_orders + total_price_points - 1) // total_price_points
+        
+        # Calculate approximate USDT value for each order to reach target
+        total_orders_to_place = total_price_points * orders_per_price
+        if max_orders is not None:
+            total_orders_to_place = min(total_orders_to_place, max_orders)
+        
+        usdt_per_order = target_value / max(1, total_orders_to_place)
+        
+        # Convert to base currency amount
+        # For sell orders, we use current price for consistency in calculation
+        # We divide USDT value by current price to get base currency amount
+        base_amount = usdt_per_order / max(current_price, 0.00000001)
+        
+        # Cap amount based on min/max ask amount settings
+        if base_amount < self.min_ask_amount:
+            base_amount = self.min_ask_amount
+        elif base_amount > self.max_ask_amount:
+            base_amount = self.max_ask_amount
+        
+        # Calculate total value after capping (using current price as reference)
+        total_value_after_cap = base_amount * current_price * total_orders_to_place
+        
+        # If total is significantly less than target, try to scale up within min/max limits
+        if total_value_after_cap < target_value * 0.9 and total_value_after_cap > 0:
+            scale_factor = target_value / total_value_after_cap
+            
+            # Scale up amount but respect max limit
+            adjusted_amount = base_amount * scale_factor
+            if adjusted_amount > self.max_ask_amount:
+                adjusted_amount = self.max_ask_amount
+            
+            # Update amount with scaled version
+            base_amount = adjusted_amount
+        
+        # Prepare to distribute orders across prices
+        order_distribution = []
+        placed_order_count = 0
+        
+        for i, price in enumerate(price_points):
+            # Calculate how many orders to place at this price
+            remaining_capacity = 0 if max_orders is None else max_orders - placed_order_count
+            
+            if max_orders is not None and placed_order_count >= max_orders:
+                break
+                
+            # Determine orders at this price point
+            orders_at_this_price = orders_per_price
+            
+            # If we have a max_orders limit, make sure we don't exceed it
+            if max_orders is not None:
+                orders_at_this_price = min(orders_at_this_price, remaining_capacity)
+            
+            # Add orders to our distribution
+            for _ in range(orders_at_this_price):
+                order_distribution.append((price, base_amount))
+                placed_order_count += 1
+                
+                # Check if we've hit the maximum
+                if max_orders is not None and placed_order_count >= max_orders:
+                    break
+        
+        # Now place the orders
+        results = []
         orders_placed = 0
+        total_value_placed = 0
         
-        # Handle the "open order size is too large" error
-        consecutive_errors = 0
-        
-        # Continue placing orders until we reach the target value AND minimum order count
-        while (total_value_placed < target_value or orders_placed < min_orders):
-            # Break if we've reached the maximum orders (if specified)
-            if max_orders is not None and orders_placed >= max_orders:
-                print(f"Reached maximum order limit of {max_orders}, stopping order placement")
-                break
-                
-            # Break if we've had too many consecutive errors
-            if consecutive_errors >= 3:
-                print("Too many consecutive errors, stopping order placement")
-                break
-                
+        for price, amount in order_distribution:
             try:
-                # Generate a random price within the range
-                # Bias slightly toward current price (better chance of execution)
-                random_factor = random.random() ** 1.5  # Power of 1.5 biases toward higher values
-                price = round(current_price + (price_range * random_factor), 8)
+                # Round amount to 8 decimal places (or whatever precision the exchange requires)
+                rounded_amount = round(amount, 8)
                 
-                # Calculate remaining value needed
-                remaining_value = max(5.0, target_value - total_value_placed)
-                
-                # Generate random order size based on remaining value and min/max constraints
-                # Base calculations on current price for consistent USDT value
-                # Min size is either our configured min or enough to sell 5 USDT worth, whichever is larger
-                min_size = max(self.min_ask_amount, 5 / current_price)
-                
-                # Max size is either our configured max or enough for 50% of remaining value
-                # This ensures we don't use up all remaining value in one order
-                max_size = min(self.max_ask_amount, (remaining_value * 0.5) / current_price)
-                
-                # If max < min, use min
-                if max_size < min_size:
-                    max_size = min_size
-                
-                # Random amount between min and max
-                amount = round(random.uniform(min_size, max_size), 8)
-                
-                # Calculate actual USDT value of this order (using current price for consistency)
-                usdt_value = amount * current_price
-                
-                # Ensure we don't exceed target by too much (unless we need minimum orders)
-                if orders_placed >= min_orders and total_value_placed + usdt_value > target_value * 1.05:
-                    # Adjust amount to reach target exactly
-                    amount = round((target_value - total_value_placed) / current_price, 8)
-                    usdt_value = amount * current_price
-                
-                # Skip order if amount is too small
-                if amount < self.min_ask_amount or usdt_value < 5:
+                # Skip very small amounts
+                if rounded_amount < 0.00000001:
                     continue
                 
-                print(f"Placing depth sell order: {amount} {self.symbol} @ {price} = {usdt_value:.2f} USDT ({(price/current_price*100):.2f}% of current price)")
+                print(f"Placing sell order: {rounded_amount} at price {price:.8f} = {rounded_amount * current_price:.2f} USDT")
                 
-                # Create sell limit order
-                result = self.exchange.create_order(
-                    symbol=self.symbol,
-                    type='limit',
-                    side='sell',
-                    amount=amount,
-                    price=price
-                )
+                # Place the order
+                order = self.exchange.create_limit_sell_order(self.symbol, rounded_amount, price)
                 
-                # Reset error counter on success
-                consecutive_errors = 0
+                # Track this order
+                order['timestamp'] = int(time.time() * 1000)  # Make sure order has a timestamp
+                self.depth_orders.append(order)
+                results.append(order)
                 
-                # Track as depth maintenance order
-                order_info = {
-                    'id': result['id'],
-                    'side': 'sell',
-                    'price': price,
-                    'amount': amount,
-                    'timestamp': int(time.time() * 1000),
-                    'value': usdt_value
-                }
-                self.depth_orders.append(order_info)
-                
-                # Update total placed and order count
-                total_value_placed += usdt_value
+                total_value_placed += rounded_amount * current_price
                 orders_placed += 1
                 
-                print(f"Sell depth order placed: ID {result['id']} - Progress: {total_value_placed:.2f}/{target_value:.2f} USDT ({(total_value_placed/target_value*100):.1f}%), Orders: {orders_placed}/{max(min_orders, 1)}")
-                
-                results.append(result)
-                
-                # Delay between order placements
+                # Delay between orders
                 time.sleep(self.order_placement_delay)
                 
-                # If we're very close to target and have placed minimum orders, consider it complete
-                if total_value_placed >= target_value * 0.95 and orders_placed >= min_orders:
-                    break
-                    
             except Exception as e:
-                error_msg = str(e).lower()
-                consecutive_errors += 1
-                
-                if "open order size is too large" in error_msg or "too many open orders" in error_msg:
-                    print(f"⚠️ Exchange order limit reached: {str(e)}")
-                    print("Performing emergency cleanup of old orders...")
-                    
-                    # Try to clean up some orders
-                    cleaned_up = self.cleanup_old_orders_if_needed(max_orders_to_cancel=20)
-                    
-                    # If cleanup was successful, reset error counter
-                    if cleaned_up:
-                        consecutive_errors = 0
+                if "MAX_OPEN_ORDERS" in str(e) or "maximum number of orders" in str(e):
+                    print(f"Hit exchange order limit. Cannot place more sell orders.")
+                    # Try to clean up some old orders to make room
+                    if self.cleanup_old_orders_if_needed():
                         print("Cleanup complete, continuing with order placement")
                         time.sleep(5)  # Extra wait time after cleanup
                     else:
@@ -1895,6 +2031,9 @@ def main():
     
     parser.add_argument('--max-ask-orders-per-cycle', type=int,
                       help='Maximum sell orders to place in one cycle')
+    
+    parser.add_argument('--cancel-recent-percent', type=float,
+                      help='Percentage of recent orders to cancel when hitting limits')
     
     args = parser.parse_args()
     
@@ -2111,6 +2250,10 @@ def main():
         if args.max_ask_orders_per_cycle:
             bot.max_ask_orders_per_cycle = args.max_ask_orders_per_cycle
             print(f"Command-line override: Setting maximum sell orders per cycle to {bot.max_ask_orders_per_cycle}")
+        
+        if args.cancel_recent_percent:
+            bot.cancel_recent_percent = args.cancel_recent_percent
+            print(f"Command-line override: Setting cancel recent percentage to {bot.cancel_recent_percent}%")
     
         bot.run(cycles)
 
