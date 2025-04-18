@@ -43,6 +43,19 @@ class VolumeBot:
         # Balance recovery strategy
         self.balance_recovery_strategy = os.getenv('BALANCE_RECOVERY_STRATEGY', 'cancel_orders').lower()  # 'cancel_orders' or 'sell_assets'
         
+        # Order book depth maintenance
+        self.maintain_order_book = os.getenv('MAINTAIN_ORDER_BOOK', 'false').lower() == 'true'
+        self.order_book_depth = float(os.getenv('ORDER_BOOK_DEPTH', '2.0'))  # Depth range in percentage (2%)
+        self.bid_orders_count = int(os.getenv('BID_ORDERS_COUNT', '5'))  # Number of buy orders to maintain
+        self.ask_orders_count = int(os.getenv('ASK_ORDERS_COUNT', '5'))  # Number of sell orders to maintain
+        self.min_bid_amount = float(os.getenv('MIN_BID_AMOUNT', '10'))  # Minimum amount for buy orders
+        self.max_bid_amount = float(os.getenv('MAX_BID_AMOUNT', '50'))  # Maximum amount for buy orders
+        self.min_ask_amount = float(os.getenv('MIN_ASK_AMOUNT', '10'))  # Minimum amount for sell orders
+        self.max_ask_amount = float(os.getenv('MAX_ASK_AMOUNT', '50'))  # Maximum amount for sell orders
+        self.target_bid_value = float(os.getenv('TARGET_BID_VALUE', '250'))  # Target total USDT value for buy orders
+        self.target_ask_value = float(os.getenv('TARGET_ASK_VALUE', '250'))  # Target total USDT value for sell orders
+        self.depth_orders = []  # Track orders placed for depth maintenance
+        
         # Configure exchanges based on name
         exchange_configs = {
             'lbank': {
@@ -1125,6 +1138,256 @@ class VolumeBot:
             print("No buy orders were canceled. Proceeding with caution.")
             return False
 
+    def maintain_order_book_depth(self, current_price):
+        """
+        Maintain a specific number of orders in the order book within defined depth
+        
+        Args:
+            current_price (float): Current market price
+            
+        Returns:
+            list: Newly created orders
+        """
+        if not self.maintain_order_book:
+            return []
+            
+        print(f"\nMaintaining order book depth ({self.order_book_depth}% range)...")
+        print(f"Target values: {self.target_bid_value} USDT in bids, {self.target_ask_value} USDT in asks")
+        
+        # Calculate price range
+        min_price = current_price * (1 - self.order_book_depth / 100)
+        max_price = current_price * (1 + self.order_book_depth / 100)
+        
+        print(f"Price range for depth maintenance: {min_price:.8f} - {max_price:.8f}")
+        
+        # Get existing open orders
+        try:
+            open_orders = self.exchange.fetch_open_orders(self.symbol)
+            existing_bids = [o for o in open_orders if o['side'].lower() == 'buy' and float(o['price']) >= min_price and float(o['price']) <= current_price]
+            existing_asks = [o for o in open_orders if o['side'].lower() == 'sell' and float(o['price']) >= current_price and float(o['price']) <= max_price]
+            
+            print(f"Found {len(existing_bids)} existing buy orders and {len(existing_asks)} existing sell orders in depth range")
+            
+            # Filter to get only orders placed by this bot for depth maintenance
+            bot_depth_order_ids = [o['id'] for o in self.depth_orders]
+            bot_bids = [o for o in existing_bids if o['id'] in bot_depth_order_ids]
+            bot_asks = [o for o in existing_asks if o['id'] in bot_depth_order_ids]
+            
+            print(f"Of these, {len(bot_bids)} buy orders and {len(bot_asks)} sell orders were placed by this bot")
+            
+            # Calculate existing order values
+            existing_bid_value = sum(float(o['price']) * float(o['amount']) for o in bot_bids)
+            existing_ask_value = sum(current_price * float(o['amount']) for o in bot_asks)  # Using current price for consistency
+            
+            print(f"Current buy order value: {existing_bid_value:.2f} USDT")
+            print(f"Current sell order value: {existing_ask_value:.2f} USDT")
+            
+            # Calculate how many new orders we need to place
+            bids_needed = max(0, self.bid_orders_count - len(bot_bids))
+            asks_needed = max(0, self.ask_orders_count - len(bot_asks))
+            
+            # Calculate remaining value needed
+            remaining_bid_value = max(0, self.target_bid_value - existing_bid_value)
+            remaining_ask_value = max(0, self.target_ask_value - existing_ask_value)
+            
+            # Update target values for new orders
+            if bids_needed > 0:
+                self.target_bid_value = remaining_bid_value
+                print(f"Need to place {bids_needed} new buy orders worth {remaining_bid_value:.2f} USDT")
+            
+            if asks_needed > 0:
+                self.target_ask_value = remaining_ask_value
+                print(f"Need to place {asks_needed} new sell orders worth {remaining_ask_value:.2f} USDT")
+            
+            # Clean up old depth orders that are no longer open
+            open_order_ids = [o['id'] for o in open_orders]
+            self.depth_orders = [o for o in self.depth_orders if o['id'] in open_order_ids]
+            
+            results = []
+            
+            # Place new bid orders if needed
+            if bids_needed > 0 and remaining_bid_value > 0:
+                results.extend(self.place_depth_bids(bids_needed, min_price, current_price))
+                
+            # Place new ask orders if needed
+            if asks_needed > 0 and remaining_ask_value > 0:
+                results.extend(self.place_depth_asks(asks_needed, current_price, max_price))
+                
+            # Restore original target values for next cycle
+            self.target_bid_value = float(os.getenv('TARGET_BID_VALUE', '150'))
+            self.target_ask_value = float(os.getenv('TARGET_ASK_VALUE', '150'))
+            
+            print(f"Placed {len(results)} new orders for depth maintenance")
+            return results
+            
+        except Exception as e:
+            print(f"Error maintaining order book depth: {str(e)}")
+            return []
+    
+    def place_depth_bids(self, count, min_price, current_price):
+        """
+        Place buy orders distributed across the bid range with a specific total USDT value
+        
+        Args:
+            count: Number of orders to place
+            min_price: Minimum price in the range
+            current_price: Current market price
+            
+        Returns:
+            list: Created orders
+        """
+        results = []
+        
+        if count <= 0:
+            return results
+            
+        # Evenly distribute prices across the range
+        price_range = current_price - min_price
+        price_step = price_range / (count + 1)
+        
+        # Target USDT value per order (divide total target by number of orders)
+        target_value_per_order = self.target_bid_value / count
+        print(f"Target USDT value per buy order: {target_value_per_order:.2f} USDT")
+        
+        total_value_placed = 0
+        
+        for i in range(count):
+            try:
+                # Calculate price - evenly distribute across the range
+                price = round(current_price - ((i + 1) * price_step), 8)
+                
+                # Calculate amount based on target value and price
+                # Amount = USDT value / price
+                base_amount = target_value_per_order / price
+                
+                # Add some randomness but ensure we stay close to target value
+                # Random factor between 0.9 and 1.1 (±10%)
+                random_factor = random.uniform(0.9, 1.1)
+                amount = round(base_amount * random_factor, 8)
+                
+                # Ensure amount is within min/max bounds
+                amount = max(min(amount, self.max_bid_amount), self.min_bid_amount)
+                
+                # Calculate the actual USDT value of this order
+                usdt_value = amount * price
+                total_value_placed += usdt_value
+                
+                print(f"Placing depth buy order: {amount} {self.symbol} @ {price} = {usdt_value:.2f} USDT ({(price/current_price*100):.2f}% of current price)")
+                
+                # Create buy limit order
+                result = self.exchange.create_order(
+                    symbol=self.symbol,
+                    type='limit',
+                    side='buy',
+                    amount=amount,
+                    price=price
+                )
+                
+                # Track as depth maintenance order
+                order_info = {
+                    'id': result['id'],
+                    'side': 'buy',
+                    'price': price,
+                    'amount': amount,
+                    'timestamp': int(time.time() * 1000),
+                    'value': usdt_value
+                }
+                self.depth_orders.append(order_info)
+                
+                print(f"Buy depth order placed: ID {result['id']}")
+                results.append(result)
+                
+                # Small delay between orders
+                time.sleep(0.5)
+                
+            except Exception as e:
+                print(f"Error creating depth buy order: {str(e)}")
+        
+        print(f"Total buy order value placed: {total_value_placed:.2f} USDT (target: {self.target_bid_value:.2f} USDT)")
+        return results
+    
+    def place_depth_asks(self, count, current_price, max_price):
+        """
+        Place sell orders distributed across the ask range with a specific total USDT value
+        
+        Args:
+            count: Number of orders to place
+            current_price: Current market price
+            max_price: Maximum price in the range
+            
+        Returns:
+            list: Created orders
+        """
+        results = []
+        
+        if count <= 0:
+            return results
+            
+        # Evenly distribute prices across the range
+        price_range = max_price - current_price
+        price_step = price_range / (count + 1)
+        
+        # Target USDT value per order (divide total target by number of orders)
+        target_value_per_order = self.target_ask_value / count
+        print(f"Target USDT value per sell order: {target_value_per_order:.2f} USDT")
+        
+        total_value_placed = 0
+        
+        for i in range(count):
+            try:
+                # Calculate price - evenly distribute across the range
+                price = round(current_price + ((i + 1) * price_step), 8)
+                
+                # Calculate amount based on target value and price
+                # For sell orders, we calculate using current_price to determine USDT equivalent
+                base_amount = target_value_per_order / current_price
+                
+                # Add some randomness but ensure we stay close to target value
+                # Random factor between 0.9 and 1.1 (±10%)
+                random_factor = random.uniform(0.9, 1.1)
+                amount = round(base_amount * random_factor, 8)
+                
+                # Ensure amount is within min/max bounds
+                amount = max(min(amount, self.max_ask_amount), self.min_ask_amount)
+                
+                # Calculate the actual USDT value of this order
+                usdt_value = amount * current_price  # Use current price for value calculation
+                total_value_placed += usdt_value
+                
+                print(f"Placing depth sell order: {amount} {self.symbol} @ {price} = {usdt_value:.2f} USDT ({(price/current_price*100):.2f}% of current price)")
+                
+                # Create sell limit order
+                result = self.exchange.create_order(
+                    symbol=self.symbol,
+                    type='limit',
+                    side='sell',
+                    amount=amount,
+                    price=price
+                )
+                
+                # Track as depth maintenance order
+                order_info = {
+                    'id': result['id'],
+                    'side': 'sell',
+                    'price': price,
+                    'amount': amount,
+                    'timestamp': int(time.time() * 1000),
+                    'value': usdt_value
+                }
+                self.depth_orders.append(order_info)
+                
+                print(f"Sell depth order placed: ID {result['id']}")
+                results.append(result)
+                
+                # Small delay between orders
+                time.sleep(0.5)
+                
+            except Exception as e:
+                print(f"Error creating depth sell order: {str(e)}")
+        
+        print(f"Total sell order value placed: {total_value_placed:.2f} USDT (target: {self.target_ask_value:.2f} USDT)")
+        return results
+    
     def run_cycle(self):
         """Run a single cycle of the volume bot"""
         print(f"\n--- Starting cycle at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
@@ -1155,6 +1418,13 @@ class VolumeBot:
         if self.use_daily_wave:
             print("\nApplying daily wave price pattern strategy...")
             self.update_price_direction_from_wave()
+        
+        # Maintain order book depth if enabled
+        if self.maintain_order_book:
+            print("\nMaintaining order book depth...")
+            depth_results = self.maintain_order_book_depth(current_price)
+            if depth_results:
+                print(f"Order book depth maintenance complete. {len(depth_results)} orders placed.")
         
         # Phase 1: Place initial orders around mid price (on every cycle)
         print("\nPhase 1: Setting up initial orders around mid price...")
@@ -1275,6 +1545,24 @@ def main():
     
     parser.add_argument('--balance-strategy', type=str, choices=['cancel_orders', 'sell_assets'],
                       help='Strategy to use when balance is below minimum (cancel_orders or sell_assets)')
+    
+    parser.add_argument('--maintain-depth', action='store_true',
+                      help='Maintain order book depth according to settings')
+    
+    parser.add_argument('--depth-range', type=float,
+                      help='Order book depth range in percentage (default: 2%)')
+    
+    parser.add_argument('--bid-count', type=int,
+                      help='Number of buy orders to maintain in the order book')
+    
+    parser.add_argument('--ask-count', type=int, 
+                      help='Number of sell orders to maintain in the order book')
+    
+    parser.add_argument('--bid-value', type=float,
+                      help='Target total USDT value for buy orders in the order book')
+    
+    parser.add_argument('--ask-value', type=float,
+                      help='Target total USDT value for sell orders in the order book')
     
     args = parser.parse_args()
     
@@ -1443,6 +1731,30 @@ def main():
         if args.balance_strategy:
             bot.balance_recovery_strategy = args.balance_strategy
             print(f"Command-line override: Using {bot.balance_recovery_strategy} strategy for balance recovery")
+        
+        if args.maintain_depth:
+            bot.maintain_order_book = True
+            print("Command-line override: Maintaining order book depth")
+            
+            if args.depth_range:
+                bot.order_book_depth = args.depth_range
+                print(f"Command-line override: Setting depth range to {bot.order_book_depth}%")
+                
+            if args.bid_count:
+                bot.bid_orders_count = args.bid_count
+                print(f"Command-line override: Maintaining {bot.bid_orders_count} buy orders in depth")
+                
+            if args.ask_count:
+                bot.ask_orders_count = args.ask_count
+                print(f"Command-line override: Maintaining {bot.ask_orders_count} sell orders in depth")
+            
+            if args.bid_value:
+                bot.target_bid_value = args.bid_value
+                print(f"Command-line override: Setting target buy order value to {bot.target_bid_value} USDT")
+            
+            if args.ask_value:
+                bot.target_ask_value = args.ask_value
+                print(f"Command-line override: Setting target sell order value to {bot.target_ask_value} USDT")
         
         bot.run(cycles)
 
