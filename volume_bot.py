@@ -56,6 +56,10 @@ class VolumeBot:
         self.target_ask_value = float(os.getenv('TARGET_ASK_VALUE', '250'))  # Target total USDT value for sell orders
         self.min_bid_orders = int(os.getenv('MIN_BID_ORDERS', '3'))  # Minimum number of buy orders to place
         self.min_ask_orders = int(os.getenv('MIN_ASK_ORDERS', '3'))  # Minimum number of sell orders to place
+        self.max_bid_orders_per_cycle = int(os.getenv('MAX_BID_ORDERS_PER_CYCLE', '10'))  # Maximum buy orders to place in one cycle
+        self.max_ask_orders_per_cycle = int(os.getenv('MAX_ASK_ORDERS_PER_CYCLE', '10'))  # Maximum sell orders to place in one cycle
+        self.max_open_orders = int(os.getenv('MAX_OPEN_ORDERS', '50'))  # Maximum total open orders allowed
+        self.order_placement_delay = float(os.getenv('ORDER_PLACEMENT_DELAY', '1.5'))  # Delay between order placements in seconds
         self.depth_orders = []  # Track orders placed for depth maintenance
         
         # Configure exchanges based on name
@@ -1140,6 +1144,65 @@ class VolumeBot:
             print("No buy orders were canceled. Proceeding with caution.")
             return False
 
+    def cleanup_old_orders_if_needed(self, max_orders_to_cancel=20):
+        """
+        Cancel oldest orders to make room for new ones if we're close to the order limit
+        
+        Args:
+            max_orders_to_cancel: Maximum number of orders to cancel in one cleanup
+            
+        Returns:
+            bool: True if cleanup was performed, False otherwise
+        """
+        try:
+            # Get current open orders count
+            open_orders = self.exchange.fetch_open_orders(self.symbol)
+            
+            # If we're within 80% of the max limit, cancel some old orders
+            if len(open_orders) > self.max_open_orders * 0.8:
+                print(f"\n⚠️ Open order count ({len(open_orders)}) is approaching the limit ({self.max_open_orders})")
+                print(f"Cleaning up old orders to make room for new ones...")
+                
+                # Sort by timestamp (oldest first)
+                if len(self.depth_orders) > 0:
+                    self.depth_orders.sort(key=lambda x: x.get('timestamp', 0))
+                    
+                    # Calculate how many to cancel (leave some room for new orders)
+                    orders_to_cancel = min(max_orders_to_cancel, len(self.depth_orders) // 4)
+                    
+                    if orders_to_cancel > 0:
+                        print(f"Canceling {orders_to_cancel} oldest depth maintenance orders")
+                        
+                        canceled_count = 0
+                        for i in range(orders_to_cancel):
+                            if i < len(self.depth_orders):
+                                try:
+                                    order_id = self.depth_orders[i]['id']
+                                    print(f"Canceling old depth order: ID {order_id}")
+                                    self.exchange.cancel_order(order_id, self.symbol)
+                                    canceled_count += 1
+                                    # Brief delay between cancellations
+                                    time.sleep(0.5)
+                                except Exception as e:
+                                    print(f"Error canceling order {self.depth_orders[i].get('id')}: {str(e)}")
+                        
+                        # Remove canceled orders from our tracking list
+                        self.depth_orders = self.depth_orders[canceled_count:]
+                        print(f"Canceled {canceled_count} old orders. {len(self.depth_orders)} depth orders remaining")
+                        
+                        # Allow some time for the exchange to process cancellations
+                        if canceled_count > 0:
+                            print("Waiting 5 seconds for cancellations to process...")
+                            time.sleep(5)
+                        
+                        return True
+            
+            return False
+            
+        except Exception as e:
+            print(f"Error during order cleanup: {str(e)}")
+            return False
+
     def maintain_order_book_depth(self, current_price):
         """
         Maintain a specific total USDT value of orders in the order book within defined depth
@@ -1156,6 +1219,8 @@ class VolumeBot:
         print(f"\nMaintaining order book depth ({self.order_book_depth}% range)...")
         print(f"Target values: {self.target_bid_value} USDT in bids, {self.target_ask_value} USDT in asks")
         print(f"Minimum orders: {self.min_bid_orders} bid orders, {self.min_ask_orders} ask orders")
+        print(f"Maximum orders per cycle: {self.max_bid_orders_per_cycle} bid orders, {self.max_ask_orders_per_cycle} ask orders")
+        print(f"Maximum open orders: {self.max_open_orders}")
         
         # Calculate price range
         min_price = current_price * (1 - self.order_book_depth / 100)
@@ -1165,8 +1230,17 @@ class VolumeBot:
         
         # Get existing open orders
         try:
+            # First, check if we need to clean up old orders to avoid hitting limits
+            self.cleanup_old_orders_if_needed()
+            
             # Get all open orders in the entire order book
             open_orders = self.exchange.fetch_open_orders(self.symbol)
+            
+            # Check if we're at the order limit
+            if len(open_orders) >= self.max_open_orders:
+                print(f"⚠️ WARNING: Open order count ({len(open_orders)}) has reached the maximum limit ({self.max_open_orders})")
+                print("Cannot place more orders until some existing orders are filled or canceled")
+                return []
             
             # Filter orders within our depth range
             existing_bids = [o for o in open_orders if o['side'].lower() == 'buy' and float(o['price']) >= min_price and float(o['price']) <= current_price]
@@ -1195,6 +1269,10 @@ class VolumeBot:
             open_order_ids = [o['id'] for o in open_orders]
             self.depth_orders = [o for o in self.depth_orders if o['id'] in open_order_ids]
             
+            # Calculate remaining order capacity
+            remaining_order_capacity = self.max_open_orders - len(open_orders)
+            print(f"Remaining order capacity: {remaining_order_capacity} orders")
+            
             results = []
             
             # Check if we need to place more buy orders
@@ -1204,36 +1282,110 @@ class VolumeBot:
             need_more_bids = total_bid_value_all < self.target_bid_value or len(existing_bids) < self.min_bid_orders
             need_more_asks = total_ask_value_all < self.target_ask_value or len(existing_asks) < self.min_ask_orders
             
-            # Place buy orders if needed
-            if need_more_bids:
+            # If max_orders_per_cycle is set to a very high value (999+), interpret as "no limit"
+            # This allows users to set it high to prioritize reaching the target
+            no_bid_limit = self.max_bid_orders_per_cycle >= 999
+            no_ask_limit = self.max_ask_orders_per_cycle >= 999
+            
+            # Place buy orders if needed and if we have capacity
+            if need_more_bids and remaining_order_capacity > 0:
                 remaining_bid_value = max(0, self.target_bid_value - total_bid_value_all)
                 print(f"Need to place additional buy orders: Value deficit: {remaining_bid_value:.2f} USDT, Order count: {max(0, self.min_bid_orders - len(existing_bids))}")
                 
                 # Always place at least the minimum number of orders
                 min_orders_to_place = max(0, self.min_bid_orders - len(existing_bids))
-                bid_results = self.place_depth_bids_to_target(remaining_bid_value, min_price, current_price, min_orders_to_place)
+                
+                # Cap the number of orders to place based on remaining capacity and max per cycle
+                # If no_bid_limit is True, use all available capacity to reach the target
+                if no_bid_limit:
+                    max_orders_to_place = remaining_order_capacity
+                else:
+                    max_orders_to_place = min(remaining_order_capacity, self.max_bid_orders_per_cycle)
+                
+                # Calculate average order size needed to reach target with available slots
+                avg_order_size_needed = remaining_bid_value / max(1, min_orders_to_place)
+                if avg_order_size_needed > self.max_bid_amount * current_price and not no_bid_limit:
+                    print(f"⚠️ WARNING: Average order size needed ({avg_order_size_needed:.2f} USDT) exceeds maximum ({self.max_bid_amount * current_price:.2f} USDT)")
+                    print(f"Consider increasing MAX_BID_ORDERS_PER_CYCLE to reach target or use 999 for no limit")
+                
+                bid_results = self.place_depth_bids_to_target(
+                    remaining_bid_value, 
+                    min_price, 
+                    current_price, 
+                    min_orders_to_place,
+                    max_orders=max_orders_to_place
+                )
                 results.extend(bid_results)
+                remaining_order_capacity -= len(bid_results)
+                
+                # Check if target was reached
+                bid_value_placed = sum(float(o['price']) * float(o['amount']) for o in bid_results)
+                if bid_value_placed < remaining_bid_value * 0.95 and len(bid_results) >= max_orders_to_place and not no_bid_limit:
+                    print(f"⚠️ WARNING: Only placed {bid_value_placed:.2f} USDT of {remaining_bid_value:.2f} USDT target due to order limit")
+                    print(f"Consider increasing MAX_BID_ORDERS_PER_CYCLE to reach target or use 999 for no limit")
             else:
                 print(f"Bid target already met or exceeded: {total_bid_value_all:.2f} USDT with {len(existing_bids)} orders")
                 
-            # Place sell orders if needed
-            if need_more_asks:
+            # Place sell orders if needed and if we have capacity
+            if need_more_asks and remaining_order_capacity > 0:
                 remaining_ask_value = max(0, self.target_ask_value - total_ask_value_all)
                 print(f"Need to place additional sell orders: Value deficit: {remaining_ask_value:.2f} USDT, Order count: {max(0, self.min_ask_orders - len(existing_asks))}")
                 
                 # Always place at least the minimum number of orders
                 min_orders_to_place = max(0, self.min_ask_orders - len(existing_asks))
-                ask_results = self.place_depth_asks_to_target(remaining_ask_value, current_price, max_price, min_orders_to_place)
+                
+                # Cap the number of orders to place based on remaining capacity and max per cycle
+                # If no_ask_limit is True, use all available capacity to reach the target
+                if no_ask_limit:
+                    max_orders_to_place = remaining_order_capacity
+                else:
+                    max_orders_to_place = min(remaining_order_capacity, self.max_ask_orders_per_cycle)
+                
+                # Calculate average order size needed to reach target with available slots
+                avg_order_size_needed = remaining_ask_value / max(1, min_orders_to_place)
+                if avg_order_size_needed > self.max_ask_amount * current_price and not no_ask_limit:
+                    print(f"⚠️ WARNING: Average order size needed ({avg_order_size_needed:.2f} USDT) exceeds maximum ({self.max_ask_amount * current_price:.2f} USDT)")
+                    print(f"Consider increasing MAX_ASK_ORDERS_PER_CYCLE to reach target or use 999 for no limit")
+                
+                ask_results = self.place_depth_asks_to_target(
+                    remaining_ask_value, 
+                    current_price, 
+                    max_price, 
+                    min_orders_to_place,
+                    max_orders=max_orders_to_place
+                )
                 results.extend(ask_results)
+                
+                # Check if target was reached
+                ask_value_placed = sum(current_price * float(o['amount']) for o in ask_results)
+                if ask_value_placed < remaining_ask_value * 0.95 and len(ask_results) >= max_orders_to_place and not no_ask_limit:
+                    print(f"⚠️ WARNING: Only placed {ask_value_placed:.2f} USDT of {remaining_ask_value:.2f} USDT target due to order limit")
+                    print(f"Consider increasing MAX_ASK_ORDERS_PER_CYCLE to reach target or use 999 for no limit")
             else:
                 print(f"Ask target already met or exceeded: {total_ask_value_all:.2f} USDT with {len(existing_asks)} orders")
             
             # Final summary
             if results:
                 print(f"Placed {len(results)} new orders for depth maintenance")
-                if need_more_bids or need_more_asks:
-                    print(f"Total depth after update: ~{total_bid_value_all + max(0, self.target_bid_value - total_bid_value_all):.2f} USDT in bids, "
-                         f"~{total_ask_value_all + max(0, self.target_ask_value - total_ask_value_all):.2f} USDT in asks")
+                
+                # Calculate actual values placed
+                bid_results = [o for o in results if o['side'].lower() == 'buy']
+                ask_results = [o for o in results if o['side'].lower() == 'sell']
+                bid_value_placed = sum(float(o['price']) * float(o['amount']) for o in bid_results)
+                ask_value_placed = sum(current_price * float(o['amount']) for o in ask_results)
+                
+                # Report actual totals with the actual values placed
+                print(f"Total depth after update: {total_bid_value_all + bid_value_placed:.2f} USDT in bids, "
+                     f"{total_ask_value_all + ask_value_placed:.2f} USDT in asks")
+                
+                # Show target achievement percentage
+                if need_more_bids:
+                    bid_target_percent = (total_bid_value_all + bid_value_placed) / self.target_bid_value * 100
+                    print(f"Buy target achievement: {bid_target_percent:.1f}% of {self.target_bid_value} USDT target")
+                    
+                if need_more_asks:
+                    ask_target_percent = (total_ask_value_all + ask_value_placed) / self.target_ask_value * 100
+                    print(f"Sell target achievement: {ask_target_percent:.1f}% of {self.target_ask_value} USDT target")
             else:
                 print("No new orders needed, depth maintenance complete")
                 
@@ -1243,7 +1395,7 @@ class VolumeBot:
             print(f"Error maintaining order book depth: {str(e)}")
             return []
     
-    def place_depth_bids_to_target(self, target_value, min_price, current_price, min_orders=0):
+    def place_depth_bids_to_target(self, target_value, min_price, current_price, min_orders=0, max_orders=None):
         """
         Place buy orders with random amounts until reaching target USDT value
         
@@ -1252,6 +1404,7 @@ class VolumeBot:
             min_price: Minimum price in the range
             current_price: Current market price
             min_orders: Minimum number of orders to place regardless of value
+            max_orders: Maximum number of orders to place
             
         Returns:
             list: Created orders
@@ -1266,7 +1419,7 @@ class VolumeBot:
         if target_value <= 0:
             target_value = min_orders * 5  # Ensure at least $5 per order
             
-        print(f"Placing buy orders to reach target value of {target_value:.2f} USDT (minimum {min_orders} orders)")
+        print(f"Placing buy orders to reach target value of {target_value:.2f} USDT (minimum {min_orders} orders, maximum {max_orders if max_orders else 'unlimited'} orders)")
         
         # Price range for placing orders
         price_range = current_price - min_price
@@ -1275,8 +1428,21 @@ class VolumeBot:
         total_value_placed = 0
         orders_placed = 0
         
+        # Handle the "open order size is too large" error
+        consecutive_errors = 0
+        
         # Continue placing orders until we reach the target value AND minimum order count
         while (total_value_placed < target_value or orders_placed < min_orders):
+            # Break if we've reached the maximum orders (if specified)
+            if max_orders is not None and orders_placed >= max_orders:
+                print(f"Reached maximum order limit of {max_orders}, stopping order placement")
+                break
+                
+            # Break if we've had too many consecutive errors
+            if consecutive_errors >= 3:
+                print("Too many consecutive errors, stopping order placement")
+                break
+                
             try:
                 # Generate a random price within the range
                 # Bias slightly toward current price (better chance of execution)
@@ -1325,6 +1491,9 @@ class VolumeBot:
                     price=price
                 )
                 
+                # Reset error counter on success
+                consecutive_errors = 0
+                
                 # Track as depth maintenance order
                 order_info = {
                     'id': result['id'],
@@ -1344,23 +1513,42 @@ class VolumeBot:
                 
                 results.append(result)
                 
-                # Small delay between orders
-                time.sleep(0.5)
+                # Delay between order placements
+                time.sleep(self.order_placement_delay)
                 
                 # If we're very close to target and have placed minimum orders, consider it complete
                 if total_value_placed >= target_value * 0.95 and orders_placed >= min_orders:
                     break
                     
             except Exception as e:
-                print(f"Error creating depth buy order: {str(e)}")
-                # Wait a bit longer if there was an error
-                time.sleep(2)
+                error_msg = str(e).lower()
+                consecutive_errors += 1
+                
+                if "open order size is too large" in error_msg or "too many open orders" in error_msg:
+                    print(f"⚠️ Exchange order limit reached: {str(e)}")
+                    print("Performing emergency cleanup of old orders...")
+                    
+                    # Try to clean up some orders
+                    cleaned_up = self.cleanup_old_orders_if_needed(max_orders_to_cancel=20)
+                    
+                    # If cleanup was successful, reset error counter
+                    if cleaned_up:
+                        consecutive_errors = 0
+                        print("Cleanup complete, continuing with order placement")
+                        time.sleep(5)  # Extra wait time after cleanup
+                    else:
+                        print("Unable to clean up orders, cannot place more buy orders")
+                        break
+                else:
+                    print(f"Error creating depth buy order: {str(e)}")
+                    # Wait a bit longer if there was an error
+                    time.sleep(2)
         
         print(f"Total buy order value placed: {total_value_placed:.2f} USDT (target: {target_value:.2f} USDT)")
         print(f"Total buy orders placed: {orders_placed} (minimum: {min_orders})")
         return results
     
-    def place_depth_asks_to_target(self, target_value, current_price, max_price, min_orders=0):
+    def place_depth_asks_to_target(self, target_value, current_price, max_price, min_orders=0, max_orders=None):
         """
         Place sell orders with random amounts until reaching target USDT value
         
@@ -1369,6 +1557,7 @@ class VolumeBot:
             current_price: Current market price
             max_price: Maximum price in the range
             min_orders: Minimum number of orders to place regardless of value
+            max_orders: Maximum number of orders to place
             
         Returns:
             list: Created orders
@@ -1383,7 +1572,7 @@ class VolumeBot:
         if target_value <= 0:
             target_value = min_orders * 5  # Ensure at least $5 per order
             
-        print(f"Placing sell orders to reach target value of {target_value:.2f} USDT (minimum {min_orders} orders)")
+        print(f"Placing sell orders to reach target value of {target_value:.2f} USDT (minimum {min_orders} orders, maximum {max_orders if max_orders else 'unlimited'} orders)")
         
         # Price range for placing orders
         price_range = max_price - current_price
@@ -1392,8 +1581,21 @@ class VolumeBot:
         total_value_placed = 0
         orders_placed = 0
         
+        # Handle the "open order size is too large" error
+        consecutive_errors = 0
+        
         # Continue placing orders until we reach the target value AND minimum order count
         while (total_value_placed < target_value or orders_placed < min_orders):
+            # Break if we've reached the maximum orders (if specified)
+            if max_orders is not None and orders_placed >= max_orders:
+                print(f"Reached maximum order limit of {max_orders}, stopping order placement")
+                break
+                
+            # Break if we've had too many consecutive errors
+            if consecutive_errors >= 3:
+                print("Too many consecutive errors, stopping order placement")
+                break
+                
             try:
                 # Generate a random price within the range
                 # Bias slightly toward current price (better chance of execution)
@@ -1443,6 +1645,9 @@ class VolumeBot:
                     price=price
                 )
                 
+                # Reset error counter on success
+                consecutive_errors = 0
+                
                 # Track as depth maintenance order
                 order_info = {
                     'id': result['id'],
@@ -1462,17 +1667,36 @@ class VolumeBot:
                 
                 results.append(result)
                 
-                # Small delay between orders
-                time.sleep(0.5)
+                # Delay between order placements
+                time.sleep(self.order_placement_delay)
                 
                 # If we're very close to target and have placed minimum orders, consider it complete
                 if total_value_placed >= target_value * 0.95 and orders_placed >= min_orders:
                     break
                     
             except Exception as e:
-                print(f"Error creating depth sell order: {str(e)}")
-                # Wait a bit longer if there was an error
-                time.sleep(2)
+                error_msg = str(e).lower()
+                consecutive_errors += 1
+                
+                if "open order size is too large" in error_msg or "too many open orders" in error_msg:
+                    print(f"⚠️ Exchange order limit reached: {str(e)}")
+                    print("Performing emergency cleanup of old orders...")
+                    
+                    # Try to clean up some orders
+                    cleaned_up = self.cleanup_old_orders_if_needed(max_orders_to_cancel=20)
+                    
+                    # If cleanup was successful, reset error counter
+                    if cleaned_up:
+                        consecutive_errors = 0
+                        print("Cleanup complete, continuing with order placement")
+                        time.sleep(5)  # Extra wait time after cleanup
+                    else:
+                        print("Unable to clean up orders, cannot place more sell orders")
+                        break
+                else:
+                    print(f"Error creating depth sell order: {str(e)}")
+                    # Wait a bit longer if there was an error
+                    time.sleep(2)
         
         print(f"Total sell order value placed: {total_value_placed:.2f} USDT (target: {target_value:.2f} USDT)")
         print(f"Total sell orders placed: {orders_placed} (minimum: {min_orders})")
@@ -1659,6 +1883,18 @@ def main():
     
     parser.add_argument('--min-ask-orders', type=int,
                       help='Minimum number of sell orders to maintain in depth')
+    
+    parser.add_argument('--max-open-orders', type=int,
+                      help='Maximum number of open orders allowed')
+    
+    parser.add_argument('--order-delay', type=float,
+                      help='Delay between order placements in seconds')
+    
+    parser.add_argument('--max-bid-orders-per-cycle', type=int,
+                      help='Maximum buy orders to place in one cycle')
+    
+    parser.add_argument('--max-ask-orders-per-cycle', type=int,
+                      help='Maximum sell orders to place in one cycle')
     
     args = parser.parse_args()
     
@@ -1860,6 +2096,22 @@ def main():
             bot.min_ask_orders = args.min_ask_orders
             print(f"Command-line override: Setting minimum sell order count to {bot.min_ask_orders}")
         
+        if args.max_open_orders:
+            bot.max_open_orders = args.max_open_orders
+            print(f"Command-line override: Setting maximum open orders to {bot.max_open_orders}")
+        
+        if args.order_delay:
+            bot.order_placement_delay = args.order_delay
+            print(f"Command-line override: Setting order placement delay to {bot.order_placement_delay} seconds")
+        
+        if args.max_bid_orders_per_cycle:
+            bot.max_bid_orders_per_cycle = args.max_bid_orders_per_cycle
+            print(f"Command-line override: Setting maximum buy orders per cycle to {bot.max_bid_orders_per_cycle}")
+        
+        if args.max_ask_orders_per_cycle:
+            bot.max_ask_orders_per_cycle = args.max_ask_orders_per_cycle
+            print(f"Command-line override: Setting maximum sell orders per cycle to {bot.max_ask_orders_per_cycle}")
+    
         bot.run(cycles)
 
 if __name__ == "__main__":
