@@ -54,6 +54,8 @@ class VolumeBot:
         self.max_ask_amount = float(os.getenv('MAX_ASK_AMOUNT', '50'))  # Maximum amount for sell orders
         self.target_bid_value = float(os.getenv('TARGET_BID_VALUE', '250'))  # Target total USDT value for buy orders
         self.target_ask_value = float(os.getenv('TARGET_ASK_VALUE', '250'))  # Target total USDT value for sell orders
+        self.min_bid_orders = int(os.getenv('MIN_BID_ORDERS', '3'))  # Minimum number of buy orders to place
+        self.min_ask_orders = int(os.getenv('MIN_ASK_ORDERS', '3'))  # Minimum number of sell orders to place
         self.depth_orders = []  # Track orders placed for depth maintenance
         
         # Configure exchanges based on name
@@ -1140,7 +1142,7 @@ class VolumeBot:
 
     def maintain_order_book_depth(self, current_price):
         """
-        Maintain a specific number of orders in the order book within defined depth
+        Maintain a specific total USDT value of orders in the order book within defined depth
         
         Args:
             current_price (float): Current market price
@@ -1153,6 +1155,7 @@ class VolumeBot:
             
         print(f"\nMaintaining order book depth ({self.order_book_depth}% range)...")
         print(f"Target values: {self.target_bid_value} USDT in bids, {self.target_ask_value} USDT in asks")
+        print(f"Minimum orders: {self.min_bid_orders} bid orders, {self.min_ask_orders} ask orders")
         
         # Calculate price range
         min_price = current_price * (1 - self.order_book_depth / 100)
@@ -1162,42 +1165,31 @@ class VolumeBot:
         
         # Get existing open orders
         try:
+            # Get all open orders in the entire order book
             open_orders = self.exchange.fetch_open_orders(self.symbol)
+            
+            # Filter orders within our depth range
             existing_bids = [o for o in open_orders if o['side'].lower() == 'buy' and float(o['price']) >= min_price and float(o['price']) <= current_price]
             existing_asks = [o for o in open_orders if o['side'].lower() == 'sell' and float(o['price']) >= current_price and float(o['price']) <= max_price]
             
-            print(f"Found {len(existing_bids)} existing buy orders and {len(existing_asks)} existing sell orders in depth range")
+            # Calculate total value of ALL orders in the depth range (not just our bot's)
+            total_bid_value_all = sum(float(o['price']) * float(o['amount']) for o in existing_bids)
+            total_ask_value_all = sum(current_price * float(o['amount']) for o in existing_asks)  # Using current price for consistency
+            
+            print(f"All orders in depth range: {len(existing_bids)} buy orders worth {total_bid_value_all:.2f} USDT")
+            print(f"All orders in depth range: {len(existing_asks)} sell orders worth {total_ask_value_all:.2f} USDT")
             
             # Filter to get only orders placed by this bot for depth maintenance
             bot_depth_order_ids = [o['id'] for o in self.depth_orders]
             bot_bids = [o for o in existing_bids if o['id'] in bot_depth_order_ids]
             bot_asks = [o for o in existing_asks if o['id'] in bot_depth_order_ids]
             
-            print(f"Of these, {len(bot_bids)} buy orders and {len(bot_asks)} sell orders were placed by this bot")
+            # Calculate existing order values for just our bot's orders
+            bot_bid_value = sum(float(o['price']) * float(o['amount']) for o in bot_bids)
+            bot_ask_value = sum(current_price * float(o['amount']) for o in bot_asks)  # Using current price for consistency
             
-            # Calculate existing order values
-            existing_bid_value = sum(float(o['price']) * float(o['amount']) for o in bot_bids)
-            existing_ask_value = sum(current_price * float(o['amount']) for o in bot_asks)  # Using current price for consistency
-            
-            print(f"Current buy order value: {existing_bid_value:.2f} USDT")
-            print(f"Current sell order value: {existing_ask_value:.2f} USDT")
-            
-            # Calculate how many new orders we need to place
-            bids_needed = max(0, self.bid_orders_count - len(bot_bids))
-            asks_needed = max(0, self.ask_orders_count - len(bot_asks))
-            
-            # Calculate remaining value needed
-            remaining_bid_value = max(0, self.target_bid_value - existing_bid_value)
-            remaining_ask_value = max(0, self.target_ask_value - existing_ask_value)
-            
-            # Update target values for new orders
-            if bids_needed > 0:
-                self.target_bid_value = remaining_bid_value
-                print(f"Need to place {bids_needed} new buy orders worth {remaining_bid_value:.2f} USDT")
-            
-            if asks_needed > 0:
-                self.target_ask_value = remaining_ask_value
-                print(f"Need to place {asks_needed} new sell orders worth {remaining_ask_value:.2f} USDT")
+            print(f"Bot's orders in depth range: {len(bot_bids)} buy orders worth {bot_bid_value:.2f} USDT")
+            print(f"Bot's orders in depth range: {len(bot_asks)} sell orders worth {bot_ask_value:.2f} USDT")
             
             # Clean up old depth orders that are no longer open
             open_order_ids = [o['id'] for o in open_orders]
@@ -1205,72 +1197,122 @@ class VolumeBot:
             
             results = []
             
-            # Place new bid orders if needed
-            if bids_needed > 0 and remaining_bid_value > 0:
-                results.extend(self.place_depth_bids(bids_needed, min_price, current_price))
-                
-            # Place new ask orders if needed
-            if asks_needed > 0 and remaining_ask_value > 0:
-                results.extend(self.place_depth_asks(asks_needed, current_price, max_price))
-                
-            # Restore original target values for next cycle
-            self.target_bid_value = float(os.getenv('TARGET_BID_VALUE', '150'))
-            self.target_ask_value = float(os.getenv('TARGET_ASK_VALUE', '150'))
+            # Check if we need to place more buy orders
+            # We place more orders if: 
+            # 1. Total bid value is below target, OR
+            # 2. We have fewer than the minimum number of orders
+            need_more_bids = total_bid_value_all < self.target_bid_value or len(existing_bids) < self.min_bid_orders
+            need_more_asks = total_ask_value_all < self.target_ask_value or len(existing_asks) < self.min_ask_orders
             
-            print(f"Placed {len(results)} new orders for depth maintenance")
+            # Place buy orders if needed
+            if need_more_bids:
+                remaining_bid_value = max(0, self.target_bid_value - total_bid_value_all)
+                print(f"Need to place additional buy orders: Value deficit: {remaining_bid_value:.2f} USDT, Order count: {max(0, self.min_bid_orders - len(existing_bids))}")
+                
+                # Always place at least the minimum number of orders
+                min_orders_to_place = max(0, self.min_bid_orders - len(existing_bids))
+                bid_results = self.place_depth_bids_to_target(remaining_bid_value, min_price, current_price, min_orders_to_place)
+                results.extend(bid_results)
+            else:
+                print(f"Bid target already met or exceeded: {total_bid_value_all:.2f} USDT with {len(existing_bids)} orders")
+                
+            # Place sell orders if needed
+            if need_more_asks:
+                remaining_ask_value = max(0, self.target_ask_value - total_ask_value_all)
+                print(f"Need to place additional sell orders: Value deficit: {remaining_ask_value:.2f} USDT, Order count: {max(0, self.min_ask_orders - len(existing_asks))}")
+                
+                # Always place at least the minimum number of orders
+                min_orders_to_place = max(0, self.min_ask_orders - len(existing_asks))
+                ask_results = self.place_depth_asks_to_target(remaining_ask_value, current_price, max_price, min_orders_to_place)
+                results.extend(ask_results)
+            else:
+                print(f"Ask target already met or exceeded: {total_ask_value_all:.2f} USDT with {len(existing_asks)} orders")
+            
+            # Final summary
+            if results:
+                print(f"Placed {len(results)} new orders for depth maintenance")
+                if need_more_bids or need_more_asks:
+                    print(f"Total depth after update: ~{total_bid_value_all + max(0, self.target_bid_value - total_bid_value_all):.2f} USDT in bids, "
+                         f"~{total_ask_value_all + max(0, self.target_ask_value - total_ask_value_all):.2f} USDT in asks")
+            else:
+                print("No new orders needed, depth maintenance complete")
+                
             return results
             
         except Exception as e:
             print(f"Error maintaining order book depth: {str(e)}")
             return []
     
-    def place_depth_bids(self, count, min_price, current_price):
+    def place_depth_bids_to_target(self, target_value, min_price, current_price, min_orders=0):
         """
-        Place buy orders distributed across the bid range with a specific total USDT value
+        Place buy orders with random amounts until reaching target USDT value
         
         Args:
-            count: Number of orders to place
+            target_value: Target USDT value to reach
             min_price: Minimum price in the range
             current_price: Current market price
+            min_orders: Minimum number of orders to place regardless of value
             
         Returns:
             list: Created orders
         """
         results = []
         
-        if count <= 0:
+        # If no value needed and no minimum orders required, return early
+        if target_value <= 0 and min_orders <= 0:
             return results
             
-        # Evenly distribute prices across the range
+        # If no value needed but we need to place minimum orders
+        if target_value <= 0:
+            target_value = min_orders * 5  # Ensure at least $5 per order
+            
+        print(f"Placing buy orders to reach target value of {target_value:.2f} USDT (minimum {min_orders} orders)")
+        
+        # Price range for placing orders
         price_range = current_price - min_price
-        price_step = price_range / (count + 1)
         
-        # Target USDT value per order (divide total target by number of orders)
-        target_value_per_order = self.target_bid_value / count
-        print(f"Target USDT value per buy order: {target_value_per_order:.2f} USDT")
-        
+        # Track total value placed and order count
         total_value_placed = 0
+        orders_placed = 0
         
-        for i in range(count):
+        # Continue placing orders until we reach the target value AND minimum order count
+        while (total_value_placed < target_value or orders_placed < min_orders):
             try:
-                # Calculate price - evenly distribute across the range
-                price = round(current_price - ((i + 1) * price_step), 8)
+                # Generate a random price within the range
+                # Bias slightly toward current price (better chance of execution)
+                random_factor = random.random() ** 1.5  # Power of 1.5 biases toward higher values
+                price = round(min_price + (price_range * random_factor), 8)
                 
-                # Calculate amount based on target value and price
-                # Amount = USDT value / price
-                base_amount = target_value_per_order / price
+                # Calculate remaining value needed
+                remaining_value = max(5.0, target_value - total_value_placed)
                 
-                # Add some randomness but ensure we stay close to target value
-                # Random factor between 0.9 and 1.1 (±10%)
-                random_factor = random.uniform(0.9, 1.1)
-                amount = round(base_amount * random_factor, 8)
+                # Generate random order size based on remaining value and min/max constraints
+                # Min size is either our configured min or enough to buy 5 USDT worth, whichever is larger
+                min_size = max(self.min_bid_amount, 5 / price)
                 
-                # Ensure amount is within min/max bounds
-                amount = max(min(amount, self.max_bid_amount), self.min_bid_amount)
+                # Max size is either our configured max or enough for 50% of remaining value
+                # This ensures we don't use up all remaining value in one order
+                max_size = min(self.max_bid_amount, (remaining_value * 0.5) / price)
                 
-                # Calculate the actual USDT value of this order
+                # If max < min, use min
+                if max_size < min_size:
+                    max_size = min_size
+                
+                # Random amount between min and max
+                amount = round(random.uniform(min_size, max_size), 8)
+                
+                # Calculate actual USDT value of this order
                 usdt_value = amount * price
-                total_value_placed += usdt_value
+                
+                # Ensure we don't exceed target by too much (unless we need minimum orders)
+                if orders_placed >= min_orders and total_value_placed + usdt_value > target_value * 1.05:
+                    # Adjust amount to reach target exactly
+                    amount = round((target_value - total_value_placed) / price, 8)
+                    usdt_value = amount * price
+                
+                # Skip order if amount is too small
+                if amount < self.min_bid_amount or usdt_value < 5:
+                    continue
                 
                 print(f"Placing depth buy order: {amount} {self.symbol} @ {price} = {usdt_value:.2f} USDT ({(price/current_price*100):.2f}% of current price)")
                 
@@ -1294,65 +1336,101 @@ class VolumeBot:
                 }
                 self.depth_orders.append(order_info)
                 
-                print(f"Buy depth order placed: ID {result['id']}")
+                # Update total placed and order count
+                total_value_placed += usdt_value
+                orders_placed += 1
+                
+                print(f"Buy depth order placed: ID {result['id']} - Progress: {total_value_placed:.2f}/{target_value:.2f} USDT ({(total_value_placed/target_value*100):.1f}%), Orders: {orders_placed}/{max(min_orders, 1)}")
+                
                 results.append(result)
                 
                 # Small delay between orders
                 time.sleep(0.5)
                 
+                # If we're very close to target and have placed minimum orders, consider it complete
+                if total_value_placed >= target_value * 0.95 and orders_placed >= min_orders:
+                    break
+                    
             except Exception as e:
                 print(f"Error creating depth buy order: {str(e)}")
+                # Wait a bit longer if there was an error
+                time.sleep(2)
         
-        print(f"Total buy order value placed: {total_value_placed:.2f} USDT (target: {self.target_bid_value:.2f} USDT)")
+        print(f"Total buy order value placed: {total_value_placed:.2f} USDT (target: {target_value:.2f} USDT)")
+        print(f"Total buy orders placed: {orders_placed} (minimum: {min_orders})")
         return results
     
-    def place_depth_asks(self, count, current_price, max_price):
+    def place_depth_asks_to_target(self, target_value, current_price, max_price, min_orders=0):
         """
-        Place sell orders distributed across the ask range with a specific total USDT value
+        Place sell orders with random amounts until reaching target USDT value
         
         Args:
-            count: Number of orders to place
+            target_value: Target USDT value to reach
             current_price: Current market price
             max_price: Maximum price in the range
+            min_orders: Minimum number of orders to place regardless of value
             
         Returns:
             list: Created orders
         """
         results = []
         
-        if count <= 0:
+        # If no value needed and no minimum orders required, return early
+        if target_value <= 0 and min_orders <= 0:
             return results
             
-        # Evenly distribute prices across the range
+        # If no value needed but we need to place minimum orders
+        if target_value <= 0:
+            target_value = min_orders * 5  # Ensure at least $5 per order
+            
+        print(f"Placing sell orders to reach target value of {target_value:.2f} USDT (minimum {min_orders} orders)")
+        
+        # Price range for placing orders
         price_range = max_price - current_price
-        price_step = price_range / (count + 1)
         
-        # Target USDT value per order (divide total target by number of orders)
-        target_value_per_order = self.target_ask_value / count
-        print(f"Target USDT value per sell order: {target_value_per_order:.2f} USDT")
-        
+        # Track total value placed and order count
         total_value_placed = 0
+        orders_placed = 0
         
-        for i in range(count):
+        # Continue placing orders until we reach the target value AND minimum order count
+        while (total_value_placed < target_value or orders_placed < min_orders):
             try:
-                # Calculate price - evenly distribute across the range
-                price = round(current_price + ((i + 1) * price_step), 8)
+                # Generate a random price within the range
+                # Bias slightly toward current price (better chance of execution)
+                random_factor = random.random() ** 1.5  # Power of 1.5 biases toward higher values
+                price = round(current_price + (price_range * random_factor), 8)
                 
-                # Calculate amount based on target value and price
-                # For sell orders, we calculate using current_price to determine USDT equivalent
-                base_amount = target_value_per_order / current_price
+                # Calculate remaining value needed
+                remaining_value = max(5.0, target_value - total_value_placed)
                 
-                # Add some randomness but ensure we stay close to target value
-                # Random factor between 0.9 and 1.1 (±10%)
-                random_factor = random.uniform(0.9, 1.1)
-                amount = round(base_amount * random_factor, 8)
+                # Generate random order size based on remaining value and min/max constraints
+                # Base calculations on current price for consistent USDT value
+                # Min size is either our configured min or enough to sell 5 USDT worth, whichever is larger
+                min_size = max(self.min_ask_amount, 5 / current_price)
                 
-                # Ensure amount is within min/max bounds
-                amount = max(min(amount, self.max_ask_amount), self.min_ask_amount)
+                # Max size is either our configured max or enough for 50% of remaining value
+                # This ensures we don't use up all remaining value in one order
+                max_size = min(self.max_ask_amount, (remaining_value * 0.5) / current_price)
                 
-                # Calculate the actual USDT value of this order
-                usdt_value = amount * current_price  # Use current price for value calculation
-                total_value_placed += usdt_value
+                # If max < min, use min
+                if max_size < min_size:
+                    max_size = min_size
+                
+                # Random amount between min and max
+                amount = round(random.uniform(min_size, max_size), 8)
+                
+                # Calculate actual USDT value of this order (using current price for consistency)
+                usdt_value = amount * current_price
+                
+                # Ensure we don't exceed target by too much (unless we need minimum orders)
+                if orders_placed >= min_orders and total_value_placed + usdt_value > target_value * 1.05:
+                    # Adjust amount to reach target exactly
+                    amount = round((target_value - total_value_placed) / current_price, 8)
+                    usdt_value = amount * current_price
+                
+                # Skip order if amount is too small
+                if amount < self.min_ask_amount or usdt_value < 5:
+                    continue
                 
                 print(f"Placing depth sell order: {amount} {self.symbol} @ {price} = {usdt_value:.2f} USDT ({(price/current_price*100):.2f}% of current price)")
                 
@@ -1376,16 +1454,28 @@ class VolumeBot:
                 }
                 self.depth_orders.append(order_info)
                 
-                print(f"Sell depth order placed: ID {result['id']}")
+                # Update total placed and order count
+                total_value_placed += usdt_value
+                orders_placed += 1
+                
+                print(f"Sell depth order placed: ID {result['id']} - Progress: {total_value_placed:.2f}/{target_value:.2f} USDT ({(total_value_placed/target_value*100):.1f}%), Orders: {orders_placed}/{max(min_orders, 1)}")
+                
                 results.append(result)
                 
                 # Small delay between orders
                 time.sleep(0.5)
                 
+                # If we're very close to target and have placed minimum orders, consider it complete
+                if total_value_placed >= target_value * 0.95 and orders_placed >= min_orders:
+                    break
+                    
             except Exception as e:
                 print(f"Error creating depth sell order: {str(e)}")
+                # Wait a bit longer if there was an error
+                time.sleep(2)
         
-        print(f"Total sell order value placed: {total_value_placed:.2f} USDT (target: {self.target_ask_value:.2f} USDT)")
+        print(f"Total sell order value placed: {total_value_placed:.2f} USDT (target: {target_value:.2f} USDT)")
+        print(f"Total sell orders placed: {orders_placed} (minimum: {min_orders})")
         return results
     
     def run_cycle(self):
@@ -1563,6 +1653,12 @@ def main():
     
     parser.add_argument('--ask-value', type=float,
                       help='Target total USDT value for sell orders in the order book')
+    
+    parser.add_argument('--min-bid-orders', type=int,
+                      help='Minimum number of buy orders to maintain in depth')
+    
+    parser.add_argument('--min-ask-orders', type=int,
+                      help='Minimum number of sell orders to maintain in depth')
     
     args = parser.parse_args()
     
@@ -1755,6 +1851,14 @@ def main():
             if args.ask_value:
                 bot.target_ask_value = args.ask_value
                 print(f"Command-line override: Setting target sell order value to {bot.target_ask_value} USDT")
+        
+        if args.min_bid_orders:
+            bot.min_bid_orders = args.min_bid_orders
+            print(f"Command-line override: Setting minimum buy order count to {bot.min_bid_orders}")
+        
+        if args.min_ask_orders:
+            bot.min_ask_orders = args.min_ask_orders
+            print(f"Command-line override: Setting minimum sell order count to {bot.min_ask_orders}")
         
         bot.run(cycles)
 
