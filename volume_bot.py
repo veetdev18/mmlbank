@@ -9,6 +9,7 @@ import random
 from datetime import datetime
 import argparse
 from dotenv import load_dotenv
+import math
 
 # Load environment variables
 load_dotenv()
@@ -48,10 +49,23 @@ class VolumeBot:
         self.order_book_depth = float(os.getenv('ORDER_BOOK_DEPTH', '2.0'))  # Depth range in percentage (2%)
         self.bid_orders_count = int(os.getenv('BID_ORDERS_COUNT', '5'))  # Number of buy orders to maintain
         self.ask_orders_count = int(os.getenv('ASK_ORDERS_COUNT', '5'))  # Number of sell orders to maintain
-        self.min_bid_amount = float(os.getenv('MIN_BID_AMOUNT', '10'))  # Minimum amount for buy orders
-        self.max_bid_amount = float(os.getenv('MAX_BID_AMOUNT', '50'))  # Maximum amount for buy orders
-        self.min_ask_amount = float(os.getenv('MIN_ASK_AMOUNT', '10'))  # Minimum amount for sell orders
-        self.max_ask_amount = float(os.getenv('MAX_ASK_AMOUNT', '50'))  # Maximum amount for sell orders
+        
+        # Exchange-specific minimum amounts
+        self.exchange_min_amounts = {
+            'lbank': 5,    # LBank typically requires higher minimum amounts
+            'mexc': 1,
+            'bingx': 1
+        }
+        
+        # Get exchange-specific minimum order amount
+        exchange_min = self.exchange_min_amounts.get(self.exchange_name, 1)
+        
+        # Use either configured values or exchange minimums
+        self.min_bid_amount = max(float(os.getenv('MIN_BID_AMOUNT', '10')), exchange_min)
+        self.max_bid_amount = float(os.getenv('MAX_BID_AMOUNT', '50'))
+        self.min_ask_amount = max(float(os.getenv('MIN_ASK_AMOUNT', '10')), exchange_min)
+        self.max_ask_amount = float(os.getenv('MAX_ASK_AMOUNT', '50'))
+        
         self.target_bid_value = float(os.getenv('TARGET_BID_VALUE', '250'))  # Target total USDT value for buy orders
         self.target_ask_value = float(os.getenv('TARGET_ASK_VALUE', '250'))  # Target total USDT value for sell orders
         self.min_bid_orders = int(os.getenv('MIN_BID_ORDERS', '3'))  # Minimum number of buy orders to place
@@ -62,6 +76,9 @@ class VolumeBot:
         self.order_placement_delay = float(os.getenv('ORDER_PLACEMENT_DELAY', '1.5'))  # Delay between order placements in seconds
         self.cancel_recent_percent = float(os.getenv('CANCEL_RECENT_PERCENT', '30'))  # Percentage of recent orders to cancel when hitting limits
         self.depth_orders = []  # Track orders placed for depth maintenance
+        
+        # Add minimum token balance setting
+        self.min_token_balance = float(os.getenv('MIN_TOKEN_BALANCE', '1.0'))
         
         # Configure exchanges based on name
         exchange_configs = {
@@ -186,7 +203,8 @@ class VolumeBot:
         
         print(f"Initialized {exchange_name} volume bot for {self.symbol}")
         print(f"Order count: {self.order_count}, Amount range: {self.min_amount}-{self.max_amount}")
-    
+        print(f"Minimum base token balance: {self.min_token_balance}, Minimum order size: {exchange_min}")
+
     def fetch_order_book(self):
         """Fetch order book for the symbol"""
         try:
@@ -247,6 +265,16 @@ class VolumeBot:
     def create_market_order(self, side, amount):
         """Create a market order to match with existing orders"""
         try:
+            # Check if we have enough balance before placing the order
+            current_price = self.get_current_price()
+            if not current_price:
+                print("Cannot get current price for balance check")
+                return None
+                
+            if not self.check_balances_before_orders(side, amount, current_price):
+                print(f"Insufficient balance for {side} market order of {amount} {self.symbol}")
+                return None
+                
             print(f"Placing {side} market order: {amount} {self.symbol}")
             
             # For LBank specifically, market buy orders require price parameter
@@ -279,51 +307,69 @@ class VolumeBot:
             print(f"Market order executed: ID {result['id']}")
             return result
         except Exception as e:
-            print(f"Error creating market order: {str(e)}")
-            
-            # Fallback to taker limit order if market order fails
-            try:
-                print(f"Attempting fallback to taker limit order...")
+            if "balance" in str(e).lower() or "insufficient" in str(e).lower() or "enough" in str(e).lower():
+                print(f"Insufficient balance error: {str(e)}")
                 
-                # Get order book to determine price
-                order_book = self.fetch_order_book()
-                if not order_book:
-                    print("Could not fetch order book for fallback limit order")
-                    return None
-                
-                # Calculate aggressive price that will be filled immediately (taker)
-                price = None
-                if side == 'buy' and order_book['asks']:
-                    # For buy, set price slightly higher than best ask
-                    price = order_book['asks'][0][0] * 1.001  # 0.1% higher
-                elif side == 'sell' and order_book['bids']:
-                    # For sell, set price slightly lower than best bid
-                    price = order_book['bids'][0][0] * 0.999  # 0.1% lower
-                
-                if not price:
-                    print("Could not determine price for fallback limit order")
-                    return None
-                
-                price = round(price, 8)
-                print(f"Placing {side} limit order (taker): {amount} {self.symbol} @ {price}")
-                
-                # Create aggressive limit order that should be filled immediately
-                result = self.exchange.create_order(
-                    symbol=self.symbol,
-                    type='limit',
-                    side=side,
-                    amount=amount,
-                    price=price
-                )
-                
-                print(f"Limit order executed: ID {result['id']}")
-                return result
-                
-            except Exception as e2:
-                print(f"Error creating fallback limit order: {str(e2)}")
+                # Try to recover balance based on the order side
+                if side.lower() == 'buy':
+                    print("Attempting to recover USDT balance...")
+                    self.recover_balance(min_balance=amount * self.get_current_price() * 1.01)
+                else:
+                    print("Attempting to recover token balance...")
+                    self.recover_token_balance(min_balance=amount)
+                    
                 return None
-            
-            return None
+            else:
+                print(f"Error creating market order: {str(e)}")
+                
+                # Fallback to taker limit order if market order fails
+                try:
+                    print(f"Attempting fallback to taker limit order...")
+                    
+                    # Get order book to determine price
+                    order_book = self.fetch_order_book()
+                    if not order_book:
+                        print("Could not fetch order book for fallback limit order")
+                        return None
+                    
+                    # Calculate aggressive price that will be filled immediately (taker)
+                    price = None
+                    if side == 'buy' and order_book['asks']:
+                        # For buy, set price slightly higher than best ask
+                        price = order_book['asks'][0][0] * 1.001  # 0.1% higher
+                    elif side == 'sell' and order_book['bids']:
+                        # For sell, set price slightly lower than best bid
+                        price = order_book['bids'][0][0] * 0.999  # 0.1% lower
+                    
+                    if not price:
+                        print("Could not determine price for fallback limit order")
+                        return None
+                    
+                    # Check if we have enough balance for this limit order
+                    if not self.check_balances_before_orders(side, amount, price):
+                        print(f"Insufficient balance for {side} limit order of {amount} {self.symbol}")
+                        return None
+                    
+                    price = round(price, 8)
+                    print(f"Placing {side} limit order (taker): {amount} {self.symbol} @ {price}")
+                    
+                    # Create aggressive limit order that should be filled immediately
+                    result = self.exchange.create_order(
+                        symbol=self.symbol,
+                        type='limit',
+                        side=side,
+                        amount=amount,
+                        price=price
+                    )
+                    
+                    print(f"Limit order executed: ID {result['id']}")
+                    return result
+                    
+                except Exception as e2:
+                    print(f"Error creating fallback limit order: {str(e2)}")
+                    return None
+                
+                return None
     
     def create_matched_orders(self, order_book):
         """
@@ -422,6 +468,11 @@ class VolumeBot:
                 # Place slightly below current price
                 price = round(current_price * (1 - 0.1 / 100), 8)  # 0.1% below
                 
+                # Check if we have enough USDT balance
+                if not self.check_balances_before_orders('buy', amount, price):
+                    print(f"Insufficient USDT balance for buy order {i+1}/{buy_count}")
+                    continue
+                
                 order = self.exchange.create_order(
                     symbol=self.symbol,
                     type='limit',
@@ -442,7 +493,12 @@ class VolumeBot:
                 results.append(order)
                 time.sleep(0.5)
             except Exception as e:
-                print(f"Error placing own buy order: {str(e)}")
+                if "balance" in str(e).lower() or "insufficient" in str(e).lower() or "enough" in str(e).lower():
+                    print(f"Insufficient balance error for buy order: {str(e)}")
+                    # Try to recover balance
+                    self.recover_balance()
+                else:
+                    print(f"Error placing own buy order: {str(e)}")
         
         # Place sell orders
         for i in range(sell_count):
@@ -450,6 +506,11 @@ class VolumeBot:
                 amount = self.create_random_amount()
                 # Place slightly above current price
                 price = round(current_price * (1 + 0.1 / 100), 8)  # 0.1% above
+                
+                # Check if we have enough token balance
+                if not self.check_balances_before_orders('sell', amount, price):
+                    print(f"Insufficient token balance for sell order {i+1}/{sell_count}")
+                    continue
                 
                 order = self.exchange.create_order(
                     symbol=self.symbol,
@@ -471,7 +532,12 @@ class VolumeBot:
                 results.append(order)
                 time.sleep(0.5)
             except Exception as e:
-                print(f"Error placing own sell order: {str(e)}")
+                if "balance" in str(e).lower() or "insufficient" in str(e).lower() or "enough" in str(e).lower():
+                    print(f"Insufficient balance error for sell order: {str(e)}")
+                    # Try to recover token balance
+                    self.recover_token_balance()
+                else:
+                    print(f"Error placing own sell order: {str(e)}")
         
         return results
     
@@ -514,6 +580,45 @@ class VolumeBot:
             print(f"Error matching with own order: {str(e)}")
             return None
     
+    def adapt_amount_for_exchange(self, amount, side):
+        """
+        Adapt the order amount to meet exchange-specific requirements
+        
+        Args:
+            amount (float): Original order amount
+            side (str): Order side ('buy' or 'sell')
+            
+        Returns:
+            float: Adjusted amount that meets exchange requirements
+        """
+        try:
+            # Get exchange-specific minimum amount
+            min_token_amount = self.exchange_min_amounts.get(self.exchange_name, 1)
+            
+            # Ensure amount meets minimum
+            if amount < min_token_amount:
+                print(f"Adjusting {side} amount from {amount} to {min_token_amount} to meet exchange minimum")
+                amount = min_token_amount
+            
+            # LBank specific handling - they may require amounts to be rounded to specific precision
+            if self.exchange_name == 'lbank':
+                # Round to 0 decimal places for most tokens on LBank
+                adjusted = math.floor(amount)
+                
+                # Ensure we still meet the minimum
+                if adjusted < min_token_amount:
+                    adjusted = min_token_amount
+                    
+                print(f"Adapting {side} amount for LBank: {amount} → {adjusted}")
+                return adjusted
+                
+            return amount
+            
+        except Exception as e:
+            print(f"Error adapting amount: {str(e)}")
+            # Return original amount if something goes wrong
+            return amount
+            
     def create_self_matching_orders(self):
         """Create self-matching orders (buy and sell at same price)"""
         results = []
@@ -567,18 +672,36 @@ class VolumeBot:
                 
                 print(f"Price within target range. Creating orders at {match_price}")
         
+        # Check available balances before placing orders
+        usdt_balance = self.get_usdt_balance()
+        token_balance = self.get_base_token_balance()
+        
+        print(f"Available balances for self-matching: {usdt_balance} USDT, {token_balance} tokens")
+        
+        # Exchange-specific minimum order amount
+        min_token_amount = self.exchange_min_amounts.get(self.exchange_name, 1)
+        
         for i in range(self.order_count):
             try:
                 # Generate random amount for the pair (same amount for buy and sell)
                 amount = self.create_random_amount()
-                print(f"Using same amount ({amount}) for self-matching buy and sell orders")
+                
+                # Adapt amount to meet exchange requirements
+                adapted_amount = self.adapt_amount_for_exchange(amount, 'buy/sell')
+                
+                # Skip if we don't have enough balance
+                if adapted_amount > token_balance or adapted_amount * match_price > usdt_balance:
+                    print(f"Insufficient balance for self-matching orders of size {adapted_amount}")
+                    continue
+                
+                print(f"Using same amount ({adapted_amount}) for self-matching buy and sell orders")
                 
                 # First place a limit buy order
                 buy_result = self.exchange.create_order(
                     symbol=self.symbol,
                     type='limit',
                     side='buy',
-                    amount=amount,
+                    amount=adapted_amount,
                     price=match_price
                 )
                 
@@ -593,7 +716,7 @@ class VolumeBot:
                     symbol=self.symbol,
                     type='limit',
                     side='sell',
-                    amount=amount,  # Using the exact same amount as the buy order
+                    amount=adapted_amount,  # Using the exact same amount as the buy order
                     price=match_price
                 )
                 
@@ -612,7 +735,7 @@ class VolumeBot:
                     print(f"Sell order status: {sell_order_status['status']}")
                     
                     # Report on balance impact
-                    print(f"Balance impact: {amount} {self.symbol} bought and sold (net zero)")
+                    print(f"Balance impact: {adapted_amount} {self.symbol} bought and sold (net zero)")
                     
                     # If orders are still open after waiting, cancel them
                     if buy_order_status['status'] == 'open':
@@ -627,7 +750,12 @@ class VolumeBot:
                     print(f"Error checking order status: {str(e)}")
                 
             except Exception as e:
-                print(f"Error creating self-matching orders: {str(e)}")
+                if "balance" in str(e).lower() or "insufficient" in str(e).lower() or "enough" in str(e).lower():
+                    print(f"Insufficient balance error: {str(e)}")
+                elif "validation" in str(e).lower():
+                    print(f"Validation error: {str(e)} - Try adjusting MIN_ORDER_AMOUNT for this exchange")
+                else:
+                    print(f"Error creating self-matching orders: {str(e)}")
         
         return results
     
@@ -815,6 +943,63 @@ class VolumeBot:
             print(f"Error fetching balance: {str(e)}")
             return 0
     
+    def get_base_token_balance(self):
+        """Get the current base token balance"""
+        try:
+            balance = self.exchange.fetch_balance()
+            
+            # Parse the trading symbol to get base asset
+            base_asset = None
+            
+            # Different exchanges format symbols differently, try to handle various formats
+            if '/' in self.symbol:
+                base_asset, _ = self.symbol.split('/')
+            elif '_' in self.symbol:
+                base_asset, _ = self.symbol.split('_')
+            
+            if not base_asset:
+                print(f"Unable to parse base asset from symbol {self.symbol}")
+                return 0
+            
+            # Try both uppercase and lowercase versions
+            base_balance = 0
+            for currency in [base_asset.upper(), base_asset.lower()]:
+                if currency in balance:
+                    base_balance = float(balance[currency].get('free', 0))
+                    print(f"Current {currency} balance: {base_balance}")
+                    return base_balance
+            
+            print(f"{base_asset} balance not found")
+            return 0
+        except Exception as e:
+            print(f"Error fetching base token balance: {str(e)}")
+            return 0
+    
+    def check_balances_before_orders(self, side, amount, price):
+        """Check if there's enough balance before placing an order"""
+        try:
+            if side.lower() == 'buy':
+                # For buy orders, check USDT balance
+                required_balance = amount * price * 1.01  # Add 1% for fees
+                current_balance = self.get_usdt_balance()
+                
+                if current_balance < required_balance:
+                    print(f"⚠️ Insufficient USDT balance: {current_balance} < {required_balance}")
+                    return False
+            else:
+                # For sell orders, check base token balance
+                required_balance = amount
+                current_balance = self.get_base_token_balance()
+                
+                if current_balance < required_balance:
+                    print(f"⚠️ Insufficient base token balance: {current_balance} < {required_balance}")
+                    return False
+                
+            return True
+        except Exception as e:
+            print(f"Error checking balances: {str(e)}")
+            return False
+    
     def cancel_recent_buy_orders(self, min_balance=100, current_balance=0):
         """
         Cancel recent buy orders until enough funds are freed to reach min_balance
@@ -888,6 +1073,83 @@ class VolumeBot:
             
         except Exception as e:
             print(f"Error canceling buy orders: {str(e)}")
+            return 0
+    
+    def cancel_recent_sell_orders(self, min_token_balance=1.0):
+        """
+        Cancel recent sell orders to free up base tokens
+        
+        Args:
+            min_token_balance: Minimum token balance threshold to aim for
+            
+        Returns:
+            int: Number of orders canceled
+        """
+        try:
+            print(f"\nCanceling sell orders to free up base tokens...")
+            
+            # Get current balance
+            current_balance = self.get_base_token_balance()
+            
+            # Calculate how much we need to free up
+            balance_deficit = min_token_balance - current_balance
+            if balance_deficit <= 0:
+                print(f"Current token balance ({current_balance}) already above minimum ({min_token_balance})")
+                return 0
+                
+            print(f"Need to free up at least {balance_deficit:.8f} tokens to reach minimum balance")
+            
+            # Fetch all open orders
+            open_orders = self.exchange.fetch_open_orders(self.symbol)
+            
+            # Filter to get only sell orders
+            sell_orders = [order for order in open_orders if order['side'].lower() == 'sell']
+            
+            if not sell_orders:
+                print("No sell orders found to cancel")
+                return 0
+            
+            print(f"Found {len(sell_orders)} open sell orders")
+            
+            # Sort by timestamp (most recent first)
+            sell_orders.sort(key=lambda x: x['timestamp'], reverse=True)
+            
+            # Start canceling orders until we've freed up enough or run out of orders
+            canceled_count = 0
+            freed_amount = 0
+            
+            for i, order in enumerate(sell_orders):
+                # Calculate how much token is locked in this order
+                order_amount = float(order['amount'])
+                filled_amount = float(order.get('filled', 0))
+                remaining_amount = order_amount - filled_amount
+                
+                try:
+                    print(f"Canceling sell order {i+1}/{len(sell_orders)}: ID {order['id']} - {remaining_amount} tokens")
+                    self.exchange.cancel_order(order['id'], self.symbol)
+                    canceled_count += 1
+                    freed_amount += remaining_amount
+                    
+                    print(f"Freed up approximately {remaining_amount:.8f} tokens (total: {freed_amount:.8f} tokens)")
+                    
+                    # Check if we've freed up enough
+                    if freed_amount >= balance_deficit:
+                        print(f"Freed up enough tokens ({freed_amount:.8f}) to reach minimum balance")
+                        break
+                    
+                    # Small delay between cancellations
+                    time.sleep(0.5)
+                except Exception as e:
+                    print(f"Error canceling order {order['id']}: {str(e)}")
+            
+            print(f"Successfully canceled {canceled_count} sell orders, freeing approximately {freed_amount:.8f} tokens")
+            estimated_new_balance = current_balance + freed_amount
+            print(f"Estimated new token balance: {estimated_new_balance:.8f} (minimum required: {min_token_balance})")
+            
+            return canceled_count
+            
+        except Exception as e:
+            print(f"Error canceling sell orders: {str(e)}")
             return 0
     
     def get_wave_target_percentage(self):
@@ -1515,6 +1777,23 @@ class VolumeBot:
         if max_orders is not None:
             print(f"Maximum orders to place: {max_orders}")
             
+        # Get current available USDT balance before attempting to place orders
+        available_usdt_balance = self.get_usdt_balance()
+        print(f"Available USDT balance for buy orders: {available_usdt_balance}")
+        
+        if available_usdt_balance <= 1.0:  # Minimum USDT balance
+            print("Insufficient USDT balance to place buy orders")
+            return []
+            
+        # Adjust target value if we don't have enough USDT
+        if available_usdt_balance < target_value:
+            print(f"Adjusting target value from {target_value:.2f} to {available_usdt_balance:.2f} USDT due to insufficient balance")
+            target_value = available_usdt_balance
+            
+        # Get exchange-specific minimum order amount (in base currency)
+        min_token_amount = self.exchange_min_amounts.get(self.exchange_name, 1)
+        print(f"Exchange minimum token amount: {min_token_amount}")
+        
         # Calculate the price step to distribute orders across the range
         price_range = max_price - min_price
         
@@ -1547,16 +1826,38 @@ class VolumeBot:
         if min_orders > total_price_points:
             orders_per_price = (min_orders + total_price_points - 1) // total_price_points
         
-        # Calculate approximate USDT value for each order to reach target
+        # Calculate approximately how many orders we can place with available balance
+        # First, estimate the minimum USDT per order
+        min_usdt_per_order = min_token_amount * current_price
+        max_possible_orders = max(1, int(available_usdt_balance / min_usdt_per_order))
+        print(f"Maximum possible orders with available balance: {max_possible_orders}")
+        
+        # Adjust total orders based on available balance
         total_orders_to_place = total_price_points * orders_per_price
         if max_orders is not None:
             total_orders_to_place = min(total_orders_to_place, max_orders)
         
-        usdt_per_order = target_value / max(1, total_orders_to_place)
+        # Cap by what's possible with our balance
+        total_orders_to_place = min(total_orders_to_place, max_possible_orders)
+        print(f"Will attempt to place {total_orders_to_place} orders")
+        
+        # If we can't place any orders, exit
+        if total_orders_to_place <= 0:
+            print("Cannot place any orders with current constraints")
+            return []
+        
+        # Calculate USDT value per order to reach target with our constrained order count
+        usdt_per_order = target_value / total_orders_to_place
         
         # Convert to base currency amount
         # For buy orders, we divide USDT value by price to get base currency amount
         base_amounts = [usdt_per_order / max(price, 0.00000001) for price in price_points]
+        
+        # Check minimum order amounts and adjust
+        for i, amount in enumerate(base_amounts):
+            if amount < min_token_amount:
+                print(f"Adjusting order at price {price_points[i]:.8f} to meet minimum: {min_token_amount} tokens")
+                base_amounts[i] = min_token_amount
         
         # Cap amounts based on min/max bid amount settings
         capped_amounts = []
@@ -1572,20 +1873,32 @@ class VolumeBot:
         # Calculate total value after capping
         total_value_after_cap = sum(price * amount for price, amount in zip(price_points, capped_amounts))
         
-        # If total is less than target, try to scale up within min/max limits
-        if total_value_after_cap < target_value and total_value_after_cap > 0:
-            scale_factor = target_value / total_value_after_cap
+        # Check if total value exceeds available balance
+        if total_value_after_cap > available_usdt_balance:
+            # Scale down orders to fit available balance
+            scale_factor = available_usdt_balance / total_value_after_cap
+            print(f"Scaling down orders by factor {scale_factor:.2f} to fit available balance")
             
-            # Scale up amounts but respect max limit
-            adjusted_amounts = []
-            for amount in capped_amounts:
-                adjusted = amount * scale_factor
-                if adjusted > self.max_bid_amount:
-                    adjusted = self.max_bid_amount
-                adjusted_amounts.append(adjusted)
-                
-            # Update amounts with scaled version
-            capped_amounts = adjusted_amounts
+            # Scale down amounts
+            scaled_amounts = [amount * scale_factor for amount in capped_amounts]
+            
+            # Make sure we still meet minimums
+            for i, amount in enumerate(scaled_amounts):
+                if amount < min_token_amount:
+                    scaled_amounts[i] = min_token_amount
+            
+            # Update with scaled amounts
+            capped_amounts = scaled_amounts
+            
+            # Recalculate total value
+            total_value_after_cap = sum(price * amount for price, amount in zip(price_points, capped_amounts))
+            
+            # If we still exceed available balance, reduce number of orders
+            if total_value_after_cap > available_usdt_balance:
+                # Calculate approximately how many we can fit
+                affordable_orders = max(1, int(available_usdt_balance / (min_token_amount * current_price)))
+                print(f"Can only afford {affordable_orders} orders, reducing from {total_orders_to_place}")
+                total_orders_to_place = affordable_orders
         
         # Prepare to distribute orders across prices
         order_distribution = []
@@ -1613,6 +1926,14 @@ class VolumeBot:
                 # Check if we've hit the maximum
                 if max_orders is not None and placed_order_count >= max_orders:
                     break
+                    
+                # Check if we've hit our adjusted total based on balance
+                if placed_order_count >= total_orders_to_place:
+                    break
+            
+            # Break outer loop if we've hit our total
+            if placed_order_count >= total_orders_to_place:
+                break
         
         # Now place the orders
         results = []
@@ -1628,7 +1949,15 @@ class VolumeBot:
                 if rounded_amount < 0.00000001:
                     continue
                 
-                print(f"Placing buy order: {rounded_amount} at price {price:.8f} = {rounded_amount * price:.2f} USDT")
+                # Calculate cost of this order
+                order_cost = rounded_amount * price
+                
+                # Check if we have enough balance left
+                if total_value_placed + order_cost > available_usdt_balance:
+                    print(f"Insufficient remaining balance for next order, stopping after {orders_placed} orders")
+                    break
+                
+                print(f"Placing buy order: {rounded_amount} at price {price:.8f} = {order_cost:.2f} USDT")
                 
                 # Place the order
                 order = self.exchange.create_limit_buy_order(self.symbol, rounded_amount, price)
@@ -1638,7 +1967,7 @@ class VolumeBot:
                 self.depth_orders.append(order)
                 results.append(order)
                 
-                total_value_placed += rounded_amount * price
+                total_value_placed += order_cost
                 orders_placed += 1
                 
                 # Delay between orders
@@ -1654,6 +1983,10 @@ class VolumeBot:
                     else:
                         print("Unable to clean up orders, cannot place more buy orders")
                         break
+                elif "balance" in str(e).lower() or "insufficient" in str(e).lower() or "enough" in str(e).lower():
+                    print(f"Insufficient balance error: {str(e)}")
+                    print(f"Stopping after placing {orders_placed} orders")
+                    break
                 else:
                     print(f"Error creating depth buy order: {str(e)}")
                     # Wait a bit longer if there was an error
@@ -1696,6 +2029,43 @@ class VolumeBot:
         
         if max_orders is not None:
             print(f"Maximum orders to place: {max_orders}")
+        
+        # Get current available token balance before attempting to place orders
+        available_token_balance = self.get_base_token_balance()
+        print(f"Available token balance for sell orders: {available_token_balance}")
+        
+        if available_token_balance <= 0.00001:  # Negligible balance
+            print("Insufficient token balance to place sell orders")
+            return []
+            
+        # Calculate USDT value of available tokens at current price
+        available_value_usdt = available_token_balance * current_price
+        print(f"Available token value: {available_value_usdt:.2f} USDT")
+        
+        # Adjust target value if we don't have enough tokens
+        if available_value_usdt < target_value:
+            print(f"Adjusting target value from {target_value:.2f} to {available_value_usdt:.2f} USDT due to insufficient balance")
+            target_value = available_value_usdt
+            
+        # If adjusted target is too small, we can't place meaningful orders
+        if target_value < 1.0:  # Minimum reasonable order value
+            print(f"Adjusted target value {target_value:.2f} USDT is too small to place meaningful orders")
+            return []
+            
+        # Get exchange-specific minimum order amount
+        exchange_min_amounts = {
+            'lbank': 5,       # LBank typically requires higher minimum amounts
+            'mexc': 1,
+            'bingx': 1
+        }
+        
+        min_token_amount = exchange_min_amounts.get(self.exchange_name, 1)
+        print(f"Exchange minimum token amount: {min_token_amount}")
+        
+        # If our available balance is less than minimum, we can't place orders
+        if available_token_balance < min_token_amount:
+            print(f"Available balance {available_token_balance} is below exchange minimum {min_token_amount}")
+            return []
             
         # Calculate the price step to distribute orders across the range
         price_range = max_price - min_price
@@ -1729,17 +2099,41 @@ class VolumeBot:
         if min_orders > total_price_points:
             orders_per_price = (min_orders + total_price_points - 1) // total_price_points
         
-        # Calculate approximate USDT value for each order to reach target
+        # Calculate approximately how many orders we can place with available balance
+        max_possible_orders = max(1, int(available_token_balance / min_token_amount))
+        print(f"Maximum possible orders with available balance: {max_possible_orders}")
+        
+        # Adjust total orders based on available balance
         total_orders_to_place = total_price_points * orders_per_price
         if max_orders is not None:
             total_orders_to_place = min(total_orders_to_place, max_orders)
         
-        usdt_per_order = target_value / max(1, total_orders_to_place)
+        # Cap by what's possible with our balance
+        total_orders_to_place = min(total_orders_to_place, max_possible_orders)
+        print(f"Will attempt to place {total_orders_to_place} orders")
         
-        # Convert to base currency amount
-        # For sell orders, we use current price for consistency in calculation
-        # We divide USDT value by current price to get base currency amount
+        # If we can't place any orders, exit
+        if total_orders_to_place <= 0:
+            print("Cannot place any orders with current constraints")
+            return []
+        
+        # Calculate USDT value per order to reach target with our constrained order count
+        usdt_per_order = target_value / total_orders_to_place
+        
+        # Convert to base currency amount (token amount)
+        # Divide USDT value by price to get token amount
         base_amount = usdt_per_order / max(current_price, 0.00000001)
+        
+        # Ensure amount meets exchange minimum
+        if base_amount < min_token_amount:
+            base_amount = min_token_amount
+            print(f"Adjusting order size to meet exchange minimum: {min_token_amount} tokens")
+            
+            # Recalculate how many orders we can place with minimum size
+            max_orders_with_min_size = int(available_token_balance / min_token_amount)
+            if max_orders_with_min_size < total_orders_to_place:
+                print(f"Can only place {max_orders_with_min_size} orders of minimum size")
+                total_orders_to_place = max_orders_with_min_size
         
         # Cap amount based on min/max ask amount settings
         if base_amount < self.min_ask_amount:
@@ -1747,21 +2141,13 @@ class VolumeBot:
         elif base_amount > self.max_ask_amount:
             base_amount = self.max_ask_amount
         
-        # Calculate total value after capping (using current price as reference)
-        total_value_after_cap = base_amount * current_price * total_orders_to_place
-        
-        # If total is significantly less than target, try to scale up within min/max limits
-        if total_value_after_cap < target_value * 0.9 and total_value_after_cap > 0:
-            scale_factor = target_value / total_value_after_cap
+        # Make sure we're not exceeding available balance
+        if base_amount * total_orders_to_place > available_token_balance:
+            # Reduce order count to fit within available balance
+            new_order_count = int(available_token_balance / base_amount)
+            print(f"Reducing order count from {total_orders_to_place} to {new_order_count} to fit within available balance")
+            total_orders_to_place = new_order_count
             
-            # Scale up amount but respect max limit
-            adjusted_amount = base_amount * scale_factor
-            if adjusted_amount > self.max_ask_amount:
-                adjusted_amount = self.max_ask_amount
-            
-            # Update amount with scaled version
-            base_amount = adjusted_amount
-        
         # Prepare to distribute orders across prices
         order_distribution = []
         placed_order_count = 0
@@ -1788,11 +2174,20 @@ class VolumeBot:
                 # Check if we've hit the maximum
                 if max_orders is not None and placed_order_count >= max_orders:
                     break
+                    
+                # Check if we've hit our adjusted total based on balance
+                if placed_order_count >= total_orders_to_place:
+                    break
+            
+            # Break outer loop if we've hit our total
+            if placed_order_count >= total_orders_to_place:
+                break
         
         # Now place the orders
         results = []
         orders_placed = 0
         total_value_placed = 0
+        total_tokens_used = 0
         
         for price, amount in order_distribution:
             try:
@@ -1802,6 +2197,11 @@ class VolumeBot:
                 # Skip very small amounts
                 if rounded_amount < 0.00000001:
                     continue
+                
+                # Check if we have enough balance left
+                if total_tokens_used + rounded_amount > available_token_balance:
+                    print(f"Insufficient remaining balance for next order, stopping after {orders_placed} orders")
+                    break
                 
                 print(f"Placing sell order: {rounded_amount} at price {price:.8f} = {rounded_amount * current_price:.2f} USDT")
                 
@@ -1814,6 +2214,7 @@ class VolumeBot:
                 results.append(order)
                 
                 total_value_placed += rounded_amount * current_price
+                total_tokens_used += rounded_amount
                 orders_placed += 1
                 
                 # Delay between orders
@@ -1829,6 +2230,10 @@ class VolumeBot:
                     else:
                         print("Unable to clean up orders, cannot place more sell orders")
                         break
+                elif "balance" in str(e).lower() or "insufficient" in str(e).lower() or "enough" in str(e).lower():
+                    print(f"Insufficient balance error: {str(e)}")
+                    print(f"Stopping after placing {orders_placed} orders")
+                    break
                 else:
                     print(f"Error creating depth sell order: {str(e)}")
                     # Wait a bit longer if there was an error
@@ -1836,6 +2241,7 @@ class VolumeBot:
         
         print(f"Total sell order value placed: {total_value_placed:.2f} USDT (target: {target_value:.2f} USDT)")
         print(f"Total sell orders placed: {orders_placed} (minimum: {min_orders})")
+        print(f"Total tokens used: {total_tokens_used} out of {available_token_balance} available")
         return results
     
     def run_cycle(self):
@@ -1844,11 +2250,21 @@ class VolumeBot:
         
         # Check USDT balance first
         usdt_balance = self.get_usdt_balance()
-        min_balance_threshold = float(os.getenv('MIN_USDT_BALANCE', '100'))
+        min_usdt_balance = float(os.getenv('MIN_USDT_BALANCE', '100'))
         
-        if usdt_balance < min_balance_threshold:
+        if usdt_balance < min_usdt_balance:
             # Use the selected balance recovery strategy
-            self.recover_balance(min_balance=min_balance_threshold, current_balance=usdt_balance)
+            if not self.recover_balance(min_balance=min_usdt_balance, current_balance=usdt_balance):
+                print("⚠️ WARNING: Could not recover USDT balance. Some operations may fail.")
+        
+        # Get base token balance
+        base_token_balance = self.get_base_token_balance()
+        min_token_balance = float(os.getenv('MIN_TOKEN_BALANCE', '1.0'))
+        
+        if base_token_balance < min_token_balance:
+            # Try to recover token balance
+            if not self.recover_token_balance(min_balance=min_token_balance, current_balance=base_token_balance):
+                print("⚠️ WARNING: Could not recover token balance. Some operations may fail.")
         
         # Fetch order book
         order_book = self.fetch_order_book()
@@ -1960,6 +2376,167 @@ class VolumeBot:
         except Exception as e:
             print(f"Error fetching supported symbols: {str(e)}")
             return []
+
+    def recover_token_balance(self, min_balance=1.0, current_balance=0):
+        """
+        Recover base token balance by buying from market
+        
+        Args:
+            min_balance: Minimum base token balance threshold to aim for
+            current_balance: Current base token balance
+            
+        Returns:
+            bool: True if balance recovery was attempted, False otherwise
+        """
+        try:
+            balance_deficit = min_balance - current_balance
+            if balance_deficit <= 0:
+                print(f"Current token balance ({current_balance}) already above minimum ({min_balance})")
+                return False
+                
+            print(f"\n⚠️ WARNING: Base token balance ({current_balance:.8f}) is below minimum threshold of {min_balance}")
+            
+            # Try to buy tokens to increase balance
+            bought_amount = self.buy_base_assets_to_reach_balance(min_balance, current_balance)
+            
+            if bought_amount > 0:
+                print(f"Bought approximately {bought_amount:.8f} tokens. Waiting for balance to update...")
+                time.sleep(5)  # Wait for balance to update
+                
+                # Check balance again
+                new_balance = self.get_base_token_balance()
+                print(f"Updated token balance: {new_balance:.8f}")
+                
+                # If still below minimum, warn but continue
+                if new_balance < min_balance:
+                    print(f"⚠️ Token balance still below minimum threshold. Proceeding with caution.")
+                
+                return True
+            else:
+                print("Failed to buy tokens. Will attempt to cancel sell orders...")
+                
+                # Try to cancel sell orders to free up tokens
+                canceled = self.cancel_recent_sell_orders(min_token_balance=min_balance)
+                if canceled > 0:
+                    print(f"Canceled {canceled} sell orders. Waiting for balance to update...")
+                    time.sleep(5)
+                    
+                    # Check balance again
+                    new_balance = self.get_base_token_balance()
+                    print(f"Updated token balance: {new_balance:.8f}")
+                    
+                    if new_balance < min_balance:
+                        print(f"⚠️ Token balance still below minimum threshold. Proceeding with caution.")
+                    
+                    return True
+                else:
+                    print("Could not free up enough tokens. Proceeding with caution.")
+                    return False
+                
+        except Exception as e:
+            print(f"Error recovering token balance: {str(e)}")
+            return False
+
+    def buy_base_assets_to_reach_balance(self, min_balance=1.0, current_balance=0):
+        """
+        Buy base assets (e.g., BTC in BTC/USDT) to reach minimum base token balance
+        
+        Args:
+            min_balance: Minimum base token balance threshold to aim for
+            current_balance: Current base token balance
+            
+        Returns:
+            float: Approximate amount of base token obtained from buying
+        """
+        try:
+            print(f"\nBuying base assets to increase token balance...")
+            
+            # Calculate how much we need to buy
+            balance_deficit = min_balance - current_balance
+            if balance_deficit <= 0:
+                print(f"Current balance ({current_balance} tokens) already above minimum ({min_balance})")
+                return 0
+            
+            print(f"Need to obtain at least {balance_deficit:.8f} tokens")
+            
+            # Get current price to estimate cost
+            current_price = self.get_current_price()
+            if not current_price:
+                print("Cannot get current price to estimate cost")
+                return 0
+                
+            # Get available USDT balance to check if we can afford it
+            usdt_balance = self.get_usdt_balance()
+            estimated_cost = balance_deficit * current_price * 1.01  # Add 1% for fees
+            
+            print(f"Estimated cost to buy {balance_deficit:.8f} tokens: {estimated_cost:.2f} USDT")
+            
+            if usdt_balance < estimated_cost:
+                print(f"Not enough USDT balance ({usdt_balance}) to buy {balance_deficit} tokens (est. cost: {estimated_cost:.2f} USDT)")
+                # If we don't have enough USDT, try to free some by canceling orders
+                freed_usdt = self.cancel_recent_buy_orders(min_balance=estimated_cost, current_balance=usdt_balance)
+                if freed_usdt == 0 or self.get_usdt_balance() < estimated_cost:
+                    print("Could not free enough USDT to buy tokens")
+                    return 0
+            
+            # Check if amount meets exchange minimum requirements
+            # Get exchange-specific minimum order amount
+            exchange_min_amounts = {
+                'lbank': 5,       # LBank typically requires higher minimum amounts
+                'mexc': 1,
+                'bingx': 1
+            }
+            
+            min_order_amount = exchange_min_amounts.get(self.exchange_name, 1)
+            
+            # Ensure we're buying at least the minimum amount
+            if balance_deficit < min_order_amount:
+                print(f"Adjusting buy amount from {balance_deficit:.8f} to {min_order_amount} to meet exchange minimum")
+                amount_to_buy = min_order_amount
+            else:
+                amount_to_buy = balance_deficit
+            
+            # Create market buy order
+            try:
+                print(f"Buying {amount_to_buy} tokens at approximately {current_price} (est. cost: {amount_to_buy * current_price:.2f} USDT)")
+                
+                # For LBank specifically, market buy orders require price parameter
+                if self.exchange_name == 'lbank':
+                    result = self.exchange.create_order(
+                        symbol=self.symbol,
+                        type='market',
+                        side='buy',
+                        amount=amount_to_buy,
+                        price=current_price
+                    )
+                else:
+                    result = self.exchange.create_order(
+                        symbol=self.symbol,
+                        type='market',
+                        side='buy',
+                        amount=amount_to_buy
+                    )
+                
+                print(f"Market buy order executed: ID {result['id']}")
+                print(f"Bought approximately {amount_to_buy} tokens")
+                
+                # Wait for balance to update
+                print("Waiting 5 seconds for balance to update...")
+                time.sleep(5)
+                
+                # Check new balance
+                new_balance = self.get_base_token_balance()
+                print(f"Updated token balance: {new_balance}")
+                
+                return amount_to_buy
+                
+            except Exception as e:
+                print(f"Error buying base tokens: {str(e)}")
+                return 0
+                
+        except Exception as e:
+            print(f"Error in buy_base_assets_to_reach_balance: {str(e)}")
+            return 0
 
 def main():
     """Main function to run the volume bot"""
